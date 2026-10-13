@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: nestjs-app-postgres
+    restart: unless-stopped
+    shm_size: 128mb
+    ports:
+      - ${POSTGRES_PORT}:5432
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: nestjs-app-pgadmin
+    restart: unless-stopped
+    ports:
+      - ${PGADMIN_PORT}:80
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+    volumes:
+      - pgadmin:/var/lib/pgadmin
+  redis:
+    image: redis/redis-stack:7.4.0-v8
+    container_name: nestjs-app-redis
+    restart: unless-stopped
+    ports:
+      - ${REDIS_PORT}:6379
+      - ${REDISINSIGHT_PORT}:8001
+    environment:
+      - REDIS_ARGS=--requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis:/data
+  mongo:
+    image: mongo:8
+    container_name: nestjs-app-mongo
+    restart: unless-stopped
+    ports:
+      - ${MONGO_PORT}:27017
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD}
+    command: --wiredTigerCacheSizeGB 0.25
+    volumes:
+      - mongo:/data/db
+      - mongo-config:/data/configdb
+  nestjs-app:
+    image: nestjs-app-dev
+    build:
+      context: .
+      target: nestjs-app-dev
+      args:
+        - PORT:${PORT}
+        - METRICS_PORT:${METRICS_PORT}
+    container_name: nestjs-app-dev
+    restart: unless-stopped
+    stop_grace_period: 600s
+    ports:
+      - ${PORT}:${PORT}
+      - ${METRICS_PORT}:${METRICS_PORT}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/nestjs-app/
+volumes:
+  postgres:
+    name: nestjs-app-postgres
+  redis:
+    name: nestjs-app-redis
+  mongo:
+    name: nestjs-app-mongo
+  mongo-config:
+    name: nestjs-app-mongo-config
+  pgadmin:
+    name: nestjs-app-pgadmin
+networks:
+  default:
+    name: nestjs-app

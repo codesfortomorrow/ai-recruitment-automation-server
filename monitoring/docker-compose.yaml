@@ -1,0 +1,35 @@
+services:
+  prometheus:
+    image: prom/prometheus:v3.8.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - ${PROMETHEUS_PORT}:9090
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus:/prometheus
+  grafana:
+    image: grafana/grafana-enterprise:12.3
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - ${GFAFANA_PORT}:3000
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+    depends_on:
+      - prometheus
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - grafana:/var/lib/grafana
+volumes:
+  prometheus:
+    name: nestjs-app-prometheus
+  grafana:
+    name: nestjs-app-grafana
+networks:
+  default:
+    name: nestjs-app-monitoring

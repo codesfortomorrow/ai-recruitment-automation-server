@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: nestjs-app-postgres
+    restart: unless-stopped
+    shm_size: 128mb
+    ports:
+      - ${POSTGRES_PORT}:5432
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - ${POSTGRES_DATA_VOLUME}:/var/lib/postgresql
+  redis:
+    image: redis/redis-stack-server:7.4.0-v8
+    container_name: nestjs-app-redis
+    restart: unless-stopped
+    ports:
+      - ${REDIS_PORT}:6379
+    environment:
+      - REDIS_ARGS=--requirepass ${REDIS_PASSWORD}
+    volumes:
+      - ${REDIS_DATA_VOLUME}:/data
+  mongo:
+    image: mongo:8
+    container_name: nestjs-app-mongo
+    restart: unless-stopped
+    ports:
+      - ${MONGO_PORT}:27017
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD}
+    command: --wiredTigerCacheSizeGB 0.25
+    volumes:
+      - ${MONGO_DATA_VOLUME}/db:/data/db
+      - ${MONGO_DATA_VOLUME}/configdb:/data/configdb
+  nestjs-app:
+    image: nestjs-app-${APP_ENV}-${NODE_TYPE}
+    build:
+      context: .
+      target: nestjs-app
+      args:
+        - PORT:${PORT}
+        - METRICS_PORT:${METRICS_PORT}
+    container_name: nestjs-app-${APP_ENV}-${NODE_TYPE}
+    restart: unless-stopped
+    stop_grace_period: 600s
+    ports:
+      - ${PORT}:${PORT}
+      - ${METRICS_PORT}:${METRICS_PORT}
+    # Uncomment this to disable run application on standalone mode
+    # depends_on:
+    #   - postgres
+    #   - redis
+    volumes:
+      - .env:/nestjs-app/.env:ro
+      - ${STORAGE_DATA_VOLUME}:/nestjs-app/${STORAGE_DIR}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+networks:
+  default:
+    name: nestjs-app
