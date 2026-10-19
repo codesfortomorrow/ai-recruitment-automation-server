@@ -130,36 +130,6 @@
     "status": "COMPLETED"
   },
   {
-    "fingerprint": "fp-503-recover",
-    "candidateId": 999,
-    "gmailMessageId": "msg-503-1",
-    "attachmentId": "att-503-1",
-    "filename": "Resume_Priya.pdf",
-    "senderEmail": "priya@example.com",
-    "processedAt": "2026-10-19T11:32:25.982Z",
-    "status": "COMPLETED"
-  },
-  {
-    "fingerprint": "fp-no-dup-candidate",
-    "candidateId": 999,
-    "gmailMessageId": "msg-dup-1",
-    "attachmentId": "att-dup-1",
-    "filename": "Resume_Unique.pdf",
-    "senderEmail": "unique@example.com",
-    "processedAt": "2026-10-19T11:32:27.114Z",
-    "status": "COMPLETED"
-  },
-  {
-    "fingerprint": "fp-success-persistence",
-    "candidateId": 999,
-    "gmailMessageId": "msg-success-1",
-    "attachmentId": "att-success-1",
-    "filename": "Resume_Success.pdf",
-    "senderEmail": "success@example.com",
-    "processedAt": "2026-10-19T11:32:27.321Z",
-    "status": "COMPLETED"
-  },
-  {
     "fingerprint": "02922541512b2faac09f5ee2f09efa471461ad5ed748d7b63b882a3e8c7c09b7",
     "candidateId": 9,
     "gmailMessageId": "1a153f23dca47e8b",
@@ -227,6 +197,36 @@
     "filename": "Manshi_Agrawal_Resume.pdf",
     "senderEmail": "abhigoud198484@gmail.com",
     "processedAt": "2026-10-19T11:48:52.681Z",
+    "status": "COMPLETED"
+  },
+  {
+    "fingerprint": "fp-503-recover",
+    "candidateId": 999,
+    "gmailMessageId": "msg-503-1",
+    "attachmentId": "att-503-1",
+    "filename": "Resume_Priya.pdf",
+    "senderEmail": "priya@example.com",
+    "processedAt": "2026-10-19T13:10:21.253Z",
+    "status": "COMPLETED"
+  },
+  {
+    "fingerprint": "fp-no-dup-candidate",
+    "candidateId": 999,
+    "gmailMessageId": "msg-dup-1",
+    "attachmentId": "att-dup-1",
+    "filename": "Resume_Unique.pdf",
+    "senderEmail": "unique@example.com",
+    "processedAt": "2026-10-19T13:10:22.151Z",
+    "status": "COMPLETED"
+  },
+  {
+    "fingerprint": "fp-success-persistence",
+    "candidateId": 999,
+    "gmailMessageId": "msg-success-1",
+    "attachmentId": "att-success-1",
+    "filename": "Resume_Success.pdf",
+    "senderEmail": "success@example.com",
+    "processedAt": "2026-10-19T13:10:22.333Z",
     "status": "COMPLETED"
   }
 ]
