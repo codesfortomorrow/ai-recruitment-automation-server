@@ -163,3 +163,126 @@ model SystemSetting {
   @@id([settingId])
   @@map("system_setting")
 }
+
+enum ScreeningStatus {
+  Shortlist    @map("SHORTLIST")
+  Reject       @map("REJECT")
+  ManualReview @map("MANUAL_REVIEW")
+
+  @@map("screening_status")
+}
+
+enum NotificationStatus {
+  Pending     @map("PENDING")
+  Sent        @map("SENT")
+  Failed      @map("FAILED")
+  NotRequired @map("NOT_REQUIRED")
+
+  @@map("notification_status")
+}
+
+enum ProcessingStatus {
+  Pending    @map("PENDING")
+  Processing @map("PROCESSING")
+  Completed  @map("COMPLETED")
+  Failed     @map("FAILED")
+
+  @@map("processing_status")
+}
+
+model Candidate {
+  id                   Int                @id @default(autoincrement())
+  idempotencyKey       String             @unique @map("idempotency_key")
+  name                 String?
+  email                String?
+  phone                String?
+  jobRole              String?            @map("job_role")
+  normalizedRole       String?            @map("normalized_role")
+  skills               Json               @default("[]")
+  education            Json               @default("[]")
+  experience           Json               @default("[]")
+  projects             Json               @default("[]")
+  summary              String             @db.Text
+  matchScore           Int                @map("match_score")
+  matchedRequirements  Json               @default("[]") @map("matched_requirements")
+  missingRequirements  Json               @default("[]") @map("missing_requirements")
+  screeningStatus      ScreeningStatus    @map("screening_status")
+  screeningExplanation String             @map("screening_explanation") @db.Text
+  rejectionReason      String?            @map("rejection_reason") @db.Text
+  assignedHrId         String?            @map("assigned_hr_id")
+  assignedHrEmail      String?            @map("assigned_hr_email")
+  assignedHrName       String?            @map("assigned_hr_name")
+  processingStatus     ProcessingStatus   @default(Completed) @map("processing_status")
+  notificationStatus   NotificationStatus @default(Pending) @map("notification_status")
+  notificationAttempts Int                @default(0) @map("notification_attempts")
+  notificationError    String?            @map("notification_error") @db.Text
+  notifiedAt           DateTime?          @map("notified_at")
+  gmailMessageId       String             @map("gmail_message_id")
+  gmailThreadId        String?            @map("gmail_thread_id")
+  attachmentId         String?            @map("attachment_id")
+  filename             String?
+  mimeType             String?            @map("mime_type")
+  attachmentSize       Int?               @map("attachment_size")
+  analyzedAt           DateTime           @default(now()) @map("analyzed_at")
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+
+  notificationLogs CandidateNotificationLog[]
+
+  @@index([screeningStatus])
+  @@index([normalizedRole])
+  @@index([assignedHrEmail])
+  @@index([notificationStatus])
+  @@index([createdAt])
+  @@map("candidate")
+}
+
+model CandidateNotificationLog {
+  id          Int                @id @default(autoincrement())
+  candidateId Int                @map("candidate_id")
+  candidate   Candidate          @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  recipient   String
+  status      NotificationStatus
+  attempt     Int
+  error       String?            @db.Text
+  createdAt   DateTime           @default(now()) @map("created_at")
+
+  @@index([candidateId])
+  @@map("candidate_notification_log")
+}
+
+enum ExcelSyncStatus {
+  Success @map("SUCCESS")
+  Partial @map("PARTIAL")
+  Failed  @map("FAILED")
+  Skipped @map("SKIPPED")
+
+  @@map("excel_sync_status")
+}
+
+enum ExcelSyncTrigger {
+  Scheduled @map("SCHEDULED")
+  Manual    @map("MANUAL")
+
+  @@map("excel_sync_trigger")
+}
+
+model ExcelSyncLog {
+  id            Int              @id @default(autoincrement())
+  fileHash      String?          @map("file_hash")
+  status        ExcelSyncStatus
+  totalRows     Int              @default(0) @map("total_rows")
+  processedRows Int              @default(0) @map("processed_rows")
+  updatedRows   Int              @default(0) @map("updated_rows")
+  skippedRows   Int              @default(0) @map("skipped_rows")
+  errorCount    Int              @default(0) @map("error_count")
+  errors        Json             @default("[]")
+  startedAt     DateTime         @map("started_at")
+  completedAt   DateTime         @default(now()) @map("completed_at")
+  durationMs    Int              @map("duration_ms")
+  triggerSource ExcelSyncTrigger @default(Scheduled) @map("trigger_source")
+
+  @@index([status])
+  @@index([completedAt])
+  @@map("excel_sync_log")
+}

@@ -8,3 +8,8 @@ export * from './mail-queue.config';
 export * from './storage.config';
 export * from './auth.config';
 export * from './google.config';
+export * from './gmail.config';
+export * from './gemini.config';
+export * from './hr.config';
+export * from './excel-sync.config';
+export * from './google-sheets.config';

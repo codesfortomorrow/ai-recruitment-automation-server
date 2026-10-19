@@ -1,6 +1,7 @@
 import { Request } from 'express';
 import {
   IsBoolean,
+  IsEmail,
   IsEnum,
   IsInt,
   IsOptional,
@@ -49,6 +50,18 @@ export class EnvironmentVariables {
 
   @IsString()
   STORAGE_DIR: string;
+
+  @IsEmail({}, { message: 'HR1_EMAIL must be a valid email address' })
+  HR1_EMAIL: string;
+
+  @IsEmail({}, { message: 'HR2_EMAIL must be a valid email address' })
+  HR2_EMAIL: string;
+
+  @IsEmail(
+    {},
+    { message: 'HR_MANUAL_REVIEW_EMAIL must be a valid email address' },
+  )
+  HR_MANUAL_REVIEW_EMAIL: string;
 
   @IsOptional()
   @IsBoolean()

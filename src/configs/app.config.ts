@@ -7,6 +7,7 @@ export const appConfigFactory = registerAs('app', () => ({
   appWebUrl: process.env.APP_WEB_URL,
   adminWebUrl: process.env.ADMIN_WEB_URL,
   serverUrl: process.env.SERVER_URL,
+  publicUrl: process.env.APP_PUBLIC_URL,
   appUri: process.env.APP_URI,
   httpPayloadMaxSize: '20mb',
   cacheTtl: 60000,

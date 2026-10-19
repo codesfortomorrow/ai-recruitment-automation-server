@@ -13,6 +13,8 @@ import { MetricsInterceptor, MetricsModule, MetricsService } from './metrics';
 import { PrismaModule } from './prisma';
 import { AuthModule } from './auth';
 import { RedisModule } from './redis';
+import { MailModule } from './mail';
+import { CandidateModule } from './candidate';
 
 @Module({
   imports: [
@@ -36,6 +38,8 @@ import { RedisModule } from './redis';
     PrismaModule,
     RedisModule,
     AuthModule,
+    MailModule,
+    CandidateModule,
   ],
   controllers: [AppController],
   providers: [

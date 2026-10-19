@@ -79,4 +79,13 @@ export class MailService {
   async send(mailPayload: SendMessagePayload): Promise<void> {
     await this.mailQueue.add('send', mailPayload, this.queueConfig.options);
   }
+
+  async sendDirect(
+    mailOptions: nodemailer.SendMailOptions,
+  ): Promise<nodemailer.SentMessageInfo> {
+    return await this.transporter.sendMail({
+      from: this.config.sender,
+      ...mailOptions,
+    });
+  }
 }
