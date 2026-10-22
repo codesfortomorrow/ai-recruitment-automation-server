@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as crypto from 'crypto';
 import {
   BadRequestException,
@@ -5,6 +7,7 @@ import {
   forwardRef,
   Inject,
   Injectable,
+  InternalServerErrorException,
   NotFoundException,
   Optional,
 } from '@nestjs/common';
@@ -26,10 +29,12 @@ import {
   GoogleSheetsService,
   GoogleSheetTrackerRow,
 } from './google-sheets.service';
+import { GoogleDriveService } from './google-drive.service';
 import { GmailMessageDetail } from '../mail/gmail.types';
 import { ResumeAnalysisResult } from '../mail/gemini.types';
 import { ResumeFingerprintService } from '../mail/resume-fingerprint.service';
 import { CandidateQueryDto } from './dto/candidate-query.dto';
+import { UpdateCandidateTrackingDto } from './dto/update-candidate-tracking.dto';
 import {
   CallAttemptRecord,
   CandidateStatsResponse,
@@ -91,8 +96,208 @@ export class CandidateService extends BaseService {
     private readonly googleSheetsConfig?: ConfigType<
       typeof googleSheetsConfigFactory
     >,
+    @Optional()
+    private readonly googleDriveService?: GoogleDriveService,
   ) {
     super({ loggerDefaultMeta: { service: CandidateService.name } });
+  }
+
+  private inMemoryCandidateIdCounter = 20;
+
+  /**
+   * Concurrency-safe, persistent atomic candidate ID allocator.
+   * Backed by Redis atomic sequence 'recruitment:candidate:id_sequence' and seeded cleanly
+   * from Google Sheets and historical candidate records (baseline >= 20).
+   * Monotonically increases without resetting or reusing IDs.
+   */
+  public async allocateNextCandidateId(): Promise<number> {
+    const seqKey = 'recruitment:candidate:id_sequence';
+    if (this.redisService?.client) {
+      try {
+        const exists = await this.redisService.client.exists(seqKey);
+        if (!exists) {
+          let highestKnownId = 20;
+
+          // Check Google Sheets
+          if (this.googleSheetsService?.isConfigured()) {
+            try {
+              const rows =
+                await this.googleSheetsService.readCandidateTrackerRows();
+              for (const row of rows) {
+                if (row.candidateId > highestKnownId) {
+                  highestKnownId = row.candidateId;
+                }
+              }
+            } catch {}
+          }
+
+          // Check Redis processed candidates
+          try {
+            const processedKeys = await this.redisService.client.keys(
+              'recruitment:candidate:processed:*',
+            );
+            for (const key of processedKeys) {
+              const val = await this.redisService.client.get(key);
+              if (val) {
+                const parsed = parseInt(val, 10);
+                if (!isNaN(parsed) && parsed > highestKnownId) {
+                  highestKnownId = parsed;
+                }
+              }
+            }
+          } catch {}
+
+          await this.redisService.client.set(
+            seqKey,
+            String(Math.max(highestKnownId, 20)),
+            'NX',
+          );
+        }
+
+        const nextId = await this.redisService.client.incr(seqKey);
+        return nextId;
+      } catch (err: any) {
+        this.logger.warn(
+          `Redis atomic candidate ID allocation failed: ${err.message}; using in-memory allocator`,
+        );
+      }
+    }
+
+    this.inMemoryCandidateIdCounter = Math.max(
+      this.inMemoryCandidateIdCounter + 1,
+      21,
+    );
+    return this.inMemoryCandidateIdCounter;
+  }
+
+  /**
+   * Maps a GoogleSheetTrackerRow into an ExcelCandidateRecord format for backwards compatibility.
+   */
+  public mapGoogleSheetRowToCandidateRecord(
+    row: GoogleSheetTrackerRow,
+  ): ExcelCandidateRecord {
+    const isShortlist =
+      row.applicationStatus?.toUpperCase().includes('SHORTLIST') ||
+      row.applicationStatus === 'New';
+
+    const hr1Name = (this.hrConfig?.hr1?.name || 'Abhishek')
+      .trim()
+      .toLowerCase();
+    const hr2Name = (this.hrConfig?.hr2?.name || 'Jayendra')
+      .trim()
+      .toLowerCase();
+    const assignedName = (row.assignedHrName || '').trim().toLowerCase();
+
+    let assignedHrId: string | undefined = (row as any).assignedHrId;
+    let assignedHrEmail: string | undefined = (row as any).assignedHrEmail;
+
+    if (!assignedHrEmail || !assignedHrId) {
+      if (assignedName === hr1Name) {
+        assignedHrId = this.hrConfig?.hr1?.id || 'hr-1';
+        assignedHrEmail = this.hrConfig?.hr1?.email || undefined;
+      } else if (assignedName === hr2Name) {
+        assignedHrId = this.hrConfig?.hr2?.id || 'hr-2';
+        assignedHrEmail = this.hrConfig?.hr2?.email || undefined;
+      }
+    }
+
+    return {
+      id: row.candidateId,
+      name: row.candidateName,
+      email: row.email,
+      phone: row.phone,
+      jobRole: row.jobRole,
+      assignedHrName: row.assignedHrName,
+      assignedHrId,
+      assignedHrEmail,
+      screeningStatus: isShortlist ? 'SHORTLIST' : row.applicationStatus,
+      applicationStatus: row.applicationStatus,
+      matchScore: null,
+      summary: row.hrRemarks,
+      hrRemarks: row.hrRemarks,
+      cvLink: row.cvLink,
+      driveFileId: row.driveFileId,
+      experience: row.totalExperience,
+      currentCompany: row.currentCompany,
+      company: row.currentCompany,
+      currentInterviewRound: row.currentInterviewRound,
+      totalCallAttempts: row.totalCallAttempts,
+      callCount: row.totalCallAttempts,
+      call1Date: row.call1Date,
+      call1Status: row.call1Status,
+      call1Remarks: row.call1Remarks,
+      call2Date: row.call2Date,
+      call2Status: row.call2Status,
+      call2Remarks: row.call2Remarks,
+      call3Date: row.call3Date,
+      call3Status: row.call3Status,
+      call3Remarks: row.call3Remarks,
+      nextFollowUpDate: row.nextFollowUpDate,
+      automatedFollowUpEmailStatus: row.automatedFollowUpEmailStatus,
+      followUpEmailSentAt: row.followUpEmailSentAt,
+      lastUpdatedBy: row.lastUpdatedBy,
+      lastUpdatedAt: row.lastUpdatedAt,
+      callbackStatus: (() => {
+        const hasAnswered =
+          row.call1Status === 'Answered' ||
+          row.call2Status === 'Answered' ||
+          row.call3Status === 'Answered' ||
+          row.currentInterviewRound === 'Completed';
+        const isMissed =
+          row.totalCallAttempts >= 3 &&
+          !hasAnswered &&
+          (row.call3Status === 'Not Answered' ||
+            row.call3Status === 'Busy' ||
+            row.call3Status === 'Switched Off' ||
+            row.automatedFollowUpEmailStatus === 'SENT');
+        if (hasAnswered) return 'Completed';
+        if (isMissed) return 'Missed';
+        return 'Pending';
+      })(),
+      callStatus: (() => {
+        const hasAnswered =
+          row.call1Status === 'Answered' ||
+          row.call2Status === 'Answered' ||
+          row.call3Status === 'Answered';
+        if (hasAnswered) return 'Received';
+        if (
+          row.call1Status === 'Call Back Requested' ||
+          row.call2Status === 'Call Back Requested'
+        )
+          return 'Returned';
+        if (row.totalCallAttempts >= 3) return 'Not Applicable';
+        return '';
+      })(),
+    };
+  }
+
+  /**
+   * Dispatches email notification to assigned HR or manual review for a candidate.
+   */
+  public async dispatchNotification(
+    candidate: any,
+  ): Promise<{ sent: boolean; error?: string }> {
+    const status = candidate.screeningStatus || candidate.applicationStatus;
+    if (
+      status === 'SHORTLIST' &&
+      (candidate.assignedHrEmail ||
+        (candidate.assignedHrName && candidate.assignedHrName !== 'Unassigned'))
+    ) {
+      try {
+        await this.notificationService.notifyAssignedHr(candidate);
+        return { sent: true };
+      } catch (err: any) {
+        return { sent: false, error: err.message };
+      }
+    } else if (status === 'MANUAL_REVIEW') {
+      try {
+        await this.notificationService.notifyManualReview(candidate);
+        return { sent: true };
+      } catch (err: any) {
+        return { sent: false, error: err.message };
+      }
+    }
+    return { sent: true };
   }
 
   /**
@@ -106,12 +311,16 @@ export class CandidateService extends BaseService {
     analysisResult: ResumeAnalysisResult;
     candidateId?: number;
     forceUpdate?: boolean;
+    driveFileId?: string;
+    cvLink?: string;
   }): Promise<any | null> {
     const {
       messageDetail,
       analysisResult,
       candidateId: requestedCandidateId,
       forceUpdate,
+      driveFileId: initialDriveFileId,
+      cvLink: initialCvLink,
     } = params;
 
     if (analysisResult.status !== 'success' || !analysisResult.analysis) {
@@ -178,10 +387,16 @@ export class CandidateService extends BaseService {
     const fingerprint = analysisResult.fingerprint;
     const lockToken = analysisResult.lockToken;
 
-    // 2b. Check if resume fingerprint was already processed
+    const applicantEmail =
+      analysis.candidate?.email || messageDetail.sender?.email;
+
+    // 2b. Check if resume fingerprint was already processed for this applicant
     if (fingerprint && !forceUpdate && requestedCandidateId === undefined) {
       const isDuplicate =
-        await this.resumeFingerprintService.isFingerprintProcessed(fingerprint);
+        await this.resumeFingerprintService.isFingerprintProcessed(
+          fingerprint,
+          applicantEmail,
+        );
       if (isDuplicate) {
         this.logger.info(
           `Duplicate resume skipped; fingerprint already processed`,
@@ -229,23 +444,30 @@ export class CandidateService extends BaseService {
             );
 
           // If Google Sheets sync previously failed for this candidate, retry it now without resending HR email
-          if (existingCandidate && this.googleSheetsService.isConfigured()) {
-            try {
-              const isPending = await this.redisService.client.sismember(
-                'recruitment:google-sheets:pending_retries',
-                String(existingId),
-              );
-              if (isPending) {
-                this.logger.info(
-                  `Retrying pending Google Sheets sync for previously processed candidate ID ${existingId}`,
+          if (existingCandidate) {
+            if (this.googleSheetsService.isConfigured()) {
+              try {
+                const isPending = await this.redisService.client.sismember(
+                  'recruitment:google-sheets:pending_retries',
+                  String(existingId),
                 );
-                await this.retryCandidateSheetsSync(existingCandidate);
+                if (isPending) {
+                  this.logger.info(
+                    `Retrying pending Google Sheets sync for previously processed candidate ID ${existingId}`,
+                  );
+                  await this.retryCandidateSheetsSync(existingCandidate);
+                }
+              } catch (retryErr: any) {
+                this.logger.warn('Failed to retry pending Google Sheets sync', {
+                  candidateId: existingId,
+                  cause: this.googleSheetsService.sanitizeError(retryErr),
+                });
               }
-            } catch (retryErr: any) {
-              this.logger.warn('Failed to retry pending Google Sheets sync', {
-                candidateId: existingId,
-                cause: this.googleSheetsService.sanitizeError(retryErr),
-              });
+            } else if (this.googleSheetsService.isRequired()) {
+              this.logger.warn(
+                `Google Sheets synchronization is required for candidate ID ${existingId} but currently unconfigured: ${this.googleSheetsService.getConfigurationIssue()}`,
+                { candidateId: existingId },
+              );
             }
           }
 
@@ -282,7 +504,11 @@ export class CandidateService extends BaseService {
     };
 
     const rawRoleFromAnalysis =
-      analysis.suggestedProfile || analysis.application.jobRole;
+      analysis.application?.jobRole ||
+      (analysis as any).resolvedRole ||
+      (analysis.suggestedProfile && analysis.suggestedProfile.length <= 50
+        ? analysis.suggestedProfile
+        : null);
     const rawRoleFromSubject = messageDetail.subject;
 
     let hrAssignment = this.hrAssignmentService.assignHr(
@@ -320,9 +546,9 @@ export class CandidateService extends BaseService {
       assignedHrId = 'hr-manual-review';
       assignedHrEmail = manualReviewEmail;
       assignedHrName = 'Manual Review';
-      if (screeningStatus !== 'SHORTLIST') {
-        screeningStatus = 'MANUAL_REVIEW';
-      }
+      // CORE REQUIREMENT: Unknown or ambiguous roles must ALWAYS preserve MANUAL_REVIEW
+      // Do not automatically shortlist based only on a high score.
+      screeningStatus = 'MANUAL_REVIEW';
     }
 
     const rejectionReason =
@@ -334,53 +560,75 @@ export class CandidateService extends BaseService {
         : null;
 
     try {
-      // 6. Save candidate record directly to the Local Excel database
-      const finalRole =
-        analysis.suggestedProfile ||
-        analysis.application.jobRole ||
-        appliedRole;
+      // 5b. Ensure original CV is stored in the central Google Drive folder "Central Repository of Resume" / role subfolder
+      let driveFileId =
+        initialDriveFileId ||
+        (analysisResult as any).driveFileId ||
+        messageDetail.resumes?.find((r) => r.attachmentId === attachmentId)
+          ?.driveFileId;
+      let cvLink =
+        initialCvLink ||
+        (analysisResult as any).cvLink ||
+        messageDetail.resumes?.find((r) => r.attachmentId === attachmentId)
+          ?.cvLink;
 
-      const excelResult = await this.candidateExcelService.saveCandidate({
-        id: requestedCandidateId,
-        name: analysis.candidate.name || messageDetail.sender.name || null,
-        email: analysis.candidate.email || messageDetail.sender.email || null,
-        phone: analysis.candidate.phone || null,
-        jobRole: finalRole,
-        normalizedRole,
-        assignedHrName: assignedHrName || 'Unassigned',
-        assignedHrEmail: assignedHrEmail || null,
-        experience: analysis.application.experience || [],
-        company:
-          typeof analysis.application.experience?.[0] === 'object'
-            ? (analysis.application.experience[0] as any)?.company || null
-            : null,
-        screeningStatus,
-        rejectionReason,
-        matchScore: analysis.matchScore,
-        summary: analysis.summary,
-        recommendation:
-          analysis.recommendedStatus ||
-          (analysis as any).recommendation ||
-          screeningStatus,
-        gmailMessageId: messageDetail.id,
-        originalResume: candidateFilename,
-        notificationStatus:
-          screeningStatus === 'SHORTLIST' &&
-          (assignedHrEmail ||
-            (assignedHrName && assignedHrName !== 'Unassigned'))
-            ? 'PENDING'
-            : screeningStatus === 'MANUAL_REVIEW' &&
-                (this.hrConfig?.manualReviewEmail ||
-                  assignedHrEmail ||
-                  (assignedHrName && assignedHrName !== 'Unassigned'))
-              ? 'PENDING'
-              : 'NOT_REQUIRED',
-      });
+      if (driveFileId && !cvLink) {
+        cvLink = `=HYPERLINK("https://drive.google.com/file/d/${driveFileId}/view", "View CV")`;
+      }
+
+      let driveUploadError: string | null = null;
+      if (
+        !driveFileId &&
+        this.googleDriveService?.isConfigured() &&
+        attachmentId
+      ) {
+        try {
+          const buffer = await this.gmailService.downloadAttachment(
+            messageDetail.id,
+            attachmentId,
+          );
+          if (buffer && buffer.length > 0) {
+            const driveUpload = await this.googleDriveService.uploadCv({
+              buffer,
+              filename: candidateFilename,
+              mimeType: attachmentMeta?.mimeType,
+              candidateEmail:
+                analysis.candidate.email || messageDetail.sender?.email,
+              candidateName:
+                analysis.candidate.name || messageDetail.sender?.name,
+              role: appliedRole,
+              canonicalRole: hrAssignment?.canonicalRole || null,
+            });
+            driveFileId = driveUpload.fileId;
+            cvLink = driveUpload.cvLink;
+            await this.googleDriveService.markFileProcessed(driveUpload.fileId);
+          }
+        } catch (driveErr: any) {
+          driveUploadError = driveErr.message;
+          this.logger.warn(
+            `Failed to upload candidate resume to Google Drive: ${driveErr.message}`,
+            {
+              messageId: messageDetail.id,
+              attachmentId,
+            },
+          );
+        }
+      }
+
+      // 6. Allocate concurrency-safe atomic candidate ID (Google Sheets is the primary store)
+      // Ensure candidate record uses the canonical job role applied for, not a free-form narrative profile
+      const finalRole =
+        analysis.application?.jobRole ||
+        appliedRole ||
+        (analysis as any).resolvedRole ||
+        (analysis.suggestedProfile && analysis.suggestedProfile.length <= 50
+          ? analysis.suggestedProfile
+          : normalizedRole);
 
       const targetCandidateId =
         requestedCandidateId !== undefined
           ? requestedCandidateId
-          : excelResult.id;
+          : await this.allocateNextCandidateId();
 
       const candidateRecord = {
         id: targetCandidateId,
@@ -415,6 +663,8 @@ export class CandidateService extends BaseService {
         mimeType: attachmentMeta?.mimeType || null,
         attachmentSize: attachmentMeta?.size || null,
         analyzedAt: new Date(analysisResult.analyzedAt || Date.now()),
+        cvLink,
+        driveFileId,
       };
 
       // 7. Store attachment & idempotency metadata in Redis
@@ -426,6 +676,8 @@ export class CandidateService extends BaseService {
             attachmentId,
             filename: candidateRecord.filename,
             mimeType: candidateRecord.mimeType,
+            cvLink,
+            driveFileId,
           }),
           'EX',
           86400 * 30, // 30 days
@@ -444,10 +696,13 @@ export class CandidateService extends BaseService {
       }
 
       this.logger.info(
-        `Saved candidate ID ${targetCandidateId} (${candidateRecord.name || 'Unknown'}, Status: ${screeningStatus}, Role: ${candidateRecord.jobRole}) to local Excel`,
+        `Candidate ID ${targetCandidateId} (${candidateRecord.name || 'Unknown'}, Status: ${screeningStatus}, Role: ${candidateRecord.jobRole}) allocated. Persisting to Google Sheets...`,
       );
 
-      // 7b. Save candidate record to Google Sheets
+      let sheetsSaved = false;
+      let sheetsError: string | null = null;
+
+      // 7b. Save candidate record to Google Sheets (Permanent Candidate Store)
       if (this.googleSheetsService.isConfigured()) {
         try {
           const sheetsResult = await this.googleSheetsService.saveCandidate({
@@ -466,8 +721,11 @@ export class CandidateService extends BaseService {
             screeningStatus,
             rejectionReason,
             hrRemarks: candidateRecord.summary,
+            cvLink: candidateRecord.cvLink,
+            driveFileId: candidateRecord.driveFileId,
           });
 
+          sheetsSaved = true;
           this.logger.info(
             `Saved candidate ID ${targetCandidateId} (${candidateRecord.name || 'Unknown'}) to Google Sheets (${sheetsResult.action} row ${sheetsResult.rowNumber})`,
             {
@@ -487,8 +745,9 @@ export class CandidateService extends BaseService {
           } catch {}
         } catch (sheetsErr: any) {
           const sanitized = this.googleSheetsService.sanitizeError(sheetsErr);
+          sheetsError = sanitized;
           this.logger.error(
-            `Failed to save candidate ID ${targetCandidateId} to Google Sheets: ${sanitized}. Candidate remains safely saved in Excel and queued for retry.`,
+            `Failed to save candidate ID ${targetCandidateId} to Google Sheets: ${sanitized}. Job queued for retry.`,
             { candidateId: targetCandidateId, cause: sanitized },
           );
 
@@ -500,38 +759,65 @@ export class CandidateService extends BaseService {
           } catch {}
         }
       } else {
-        this.logger.warn(
-          `Google Sheets is not configured; skipping Google Sheets save for candidate ID ${targetCandidateId}`,
-        );
+        const issue = this.googleSheetsService.getConfigurationIssue();
+        sheetsError = issue;
+        if (this.googleSheetsService.isRequired()) {
+          this.logger.error(
+            `Google Sheets synchronization is required but cannot proceed for candidate ID ${targetCandidateId}: ${issue}. Queued in pending retries.`,
+            { candidateId: targetCandidateId, issue },
+          );
+          try {
+            await this.redisService.client.sadd(
+              'recruitment:google-sheets:pending_retries',
+              String(targetCandidateId),
+            );
+          } catch {}
+        } else {
+          this.logger.warn(
+            `Google Sheets is not configured (${issue}); skipping Google Sheets save for candidate ID ${targetCandidateId}`,
+          );
+        }
       }
+
+      let notificationSent = false;
+      let notificationError: string | null = null;
 
       // 8. Automatic Email Notifications (HR Shortlist and Manual Review)
-      // A failed email notification must not erase or report failure on a candidate already saved successfully in Excel
-      if (
-        screeningStatus === 'SHORTLIST' &&
-        (assignedHrEmail || (assignedHrName && assignedHrName !== 'Unassigned'))
-      ) {
-        try {
-          await this.notificationService.notifyAssignedHr(candidateRecord);
-        } catch (notifErr: any) {
-          this.logger.error(
-            `HR email notification failed for candidate ID ${targetCandidateId}, but candidate record remains safely saved in Excel`,
-            { cause: notifErr.message },
-          );
-        }
-      } else if (screeningStatus === 'MANUAL_REVIEW') {
-        try {
-          await this.notificationService.notifyManualReview(candidateRecord);
-        } catch (notifErr: any) {
-          this.logger.error(
-            `Manual review email notification failed for candidate ID ${targetCandidateId}, but candidate record remains safely saved in Excel`,
-            { cause: notifErr.message },
-          );
+      // Dispatched ONLY after Google Sheets save succeeds (Sheets-first completion)
+      if (sheetsSaved) {
+        if (
+          screeningStatus === 'SHORTLIST' &&
+          (assignedHrEmail ||
+            (assignedHrName && assignedHrName !== 'Unassigned'))
+        ) {
+          try {
+            await this.notificationService.notifyAssignedHr(candidateRecord);
+            notificationSent = true;
+          } catch (notifErr: any) {
+            notificationError = notifErr.message;
+            this.logger.error(
+              `HR email notification failed for candidate ID ${targetCandidateId}: ${notifErr.message}`,
+              { candidateId: targetCandidateId, cause: notifErr.message },
+            );
+          }
+        } else if (screeningStatus === 'MANUAL_REVIEW') {
+          try {
+            await this.notificationService.notifyManualReview(candidateRecord);
+            notificationSent = true;
+          } catch (notifErr: any) {
+            notificationError = notifErr.message;
+            this.logger.error(
+              `Manual review email notification failed for candidate ID ${targetCandidateId}: ${notifErr.message}`,
+              { candidateId: targetCandidateId, cause: notifErr.message },
+            );
+          }
+        } else {
+          notificationSent = true; // Not required for this screening status
         }
       }
 
-      // 9. Mark resume fingerprint as processed and release processing lock
-      if (fingerprint) {
+      // 9. Mark resume fingerprint as processed and release processing lock (if sheetsSaved)
+      if (fingerprint && sheetsSaved) {
         try {
           await this.resumeFingerprintService.markFingerprintProcessed(
             fingerprint,
@@ -542,15 +828,9 @@ export class CandidateService extends BaseService {
               filename: candidateFilename,
               senderEmail: candidateRecord.email || messageDetail.sender?.email,
               processedAt: new Date().toISOString(),
-              status: 'COMPLETED',
+              status: notificationSent ? 'COMPLETED' : 'PROCESSING',
             },
           );
-          if (lockToken) {
-            await this.resumeFingerprintService.releaseProcessingLock(
-              fingerprint,
-              lockToken,
-            );
-          }
         } catch (fpErr: any) {
           this.logger.warn('Failed to mark resume fingerprint as processed', {
             fingerprint,
@@ -559,13 +839,32 @@ export class CandidateService extends BaseService {
         }
       }
 
-      return candidateRecord;
+      if (fingerprint && lockToken) {
+        try {
+          await this.resumeFingerprintService.releaseProcessingLock(
+            fingerprint,
+            lockToken,
+          );
+        } catch {}
+      }
+
+      return {
+        ...candidateRecord,
+        sheetsSaved,
+        sheetsError,
+        notificationSent,
+        notificationError,
+        driveSaved: Boolean(driveFileId),
+        driveError: driveUploadError,
+      };
     } catch (err: any) {
       if (fingerprint && lockToken) {
-        await this.resumeFingerprintService.releaseProcessingLock(
-          fingerprint,
-          lockToken,
-        );
+        try {
+          await this.resumeFingerprintService.releaseProcessingLock(
+            fingerprint,
+            lockToken,
+          );
+        } catch {}
       }
       throw err;
     }
@@ -576,6 +875,13 @@ export class CandidateService extends BaseService {
    */
   public async retryCandidateSheetsSync(candidate: any): Promise<boolean> {
     if (!this.googleSheetsService.isConfigured()) {
+      if (this.googleSheetsService.isRequired()) {
+        const issue = this.googleSheetsService.getConfigurationIssue();
+        this.logger.error(
+          `Cannot retry Google Sheets sync for candidate ID ${candidate.id}: Google Sheets is required but not configured (${issue}).`,
+          { candidateId: candidate.id, issue },
+        );
+      }
       return false;
     }
     try {
@@ -596,6 +902,8 @@ export class CandidateService extends BaseService {
         lastCallStatus: candidate.lastCallStatus,
         lastContactDate: candidate.lastContactDate,
         nextFollowUpDate: candidate.nextFollowUpDate,
+        cvLink: candidate.cvLink,
+        driveFileId: candidate.driveFileId,
       });
 
       await this.redisService.client.srem(
@@ -664,33 +972,249 @@ export class CandidateService extends BaseService {
   }
 
   /**
-   * Retrieves dashboard statistics directly from the local Excel candidate database.
+   * Retrieves pending Google Sheets candidate synchronizations and configuration status.
+   */
+  public async getPendingSheetsSyncCandidates(): Promise<{
+    count: number;
+    pendingIds: number[];
+    isConfigured: boolean;
+    isRequired: boolean;
+    configurationIssue: string | null;
+  }> {
+    const isConfigured = this.googleSheetsService.isConfigured();
+    const isRequired = this.googleSheetsService.isRequired();
+    const configurationIssue = this.googleSheetsService.getConfigurationIssue();
+
+    if (!this.redisService?.client) {
+      return {
+        count: 0,
+        pendingIds: [],
+        isConfigured,
+        isRequired,
+        configurationIssue,
+      };
+    }
+
+    try {
+      const pendingIdsStr = await this.redisService.client.smembers(
+        'recruitment:google-sheets:pending_retries',
+      );
+      const pendingIds = pendingIdsStr
+        .map((s) => parseInt(s, 10))
+        .filter((n) => !isNaN(n))
+        .sort((a, b) => a - b);
+
+      return {
+        count: pendingIds.length,
+        pendingIds,
+        isConfigured,
+        isRequired,
+        configurationIssue,
+      };
+    } catch {
+      return {
+        count: 0,
+        pendingIds: [],
+        isConfigured,
+        isRequired,
+        configurationIssue,
+      };
+    }
+  }
+
+  /**
+   * Retrieves the operational status of the Google Sheets integration.
+   */
+  public getGoogleSheetsStatus(): {
+    configured: boolean;
+    required: boolean;
+    spreadsheetId: string | null;
+    worksheet: string;
+    configurationIssue: string | null;
+  } {
+    return {
+      configured: this.googleSheetsService.isConfigured(),
+      required: this.googleSheetsService.isRequired(),
+      spreadsheetId: this.googleSheetsService.getSpreadsheetId(),
+      worksheet: 'Candidate Tracker',
+      configurationIssue: this.googleSheetsService.getConfigurationIssue(),
+    };
+  }
+
+  /**
+   * Retrieves dashboard statistics directly from Google Sheets (or local historical backup).
    */
   async getDashboardStats(): Promise<CandidateStatsResponse> {
+    if (this.googleSheetsService?.isConfigured()) {
+      try {
+        const rows = await this.googleSheetsService.readCandidateTrackerRows();
+        if (rows && rows.length > 0) {
+          let shortlisted = 0;
+          let rejected = 0;
+          let manualReview = 0;
+          let pending = 0;
+          let assignedToHr1 = 0;
+          let assignedToHr2 = 0;
+          let unassigned = 0;
+
+          const hr1Name = (this.hrConfig?.hr1?.name || '').trim().toLowerCase();
+          const hr2Name = (this.hrConfig?.hr2?.name || '').trim().toLowerCase();
+          const roleCounts = new Map<string, number>();
+
+          for (const row of rows) {
+            const statusUpper = (row.applicationStatus || '').toUpperCase();
+            if (statusUpper.includes('SHORTLIST')) {
+              shortlisted++;
+            } else if (statusUpper.includes('REJECT')) {
+              rejected++;
+            } else if (
+              statusUpper.includes('MANUAL') ||
+              statusUpper.includes('HOLD')
+            ) {
+              manualReview++;
+            } else {
+              pending++;
+            }
+
+            const assignedName = (row.assignedHrName || '')
+              .trim()
+              .toLowerCase();
+            if (hr1Name && assignedName === hr1Name) {
+              assignedToHr1++;
+            } else if (hr2Name && assignedName === hr2Name) {
+              assignedToHr2++;
+            } else {
+              unassigned++;
+            }
+
+            const role = row.jobRole || 'Unspecified';
+            roleCounts.set(role, (roleCounts.get(role) || 0) + 1);
+          }
+
+          const total = rows.length;
+          const roleBreakdown = Array.from(roleCounts.entries()).map(
+            ([role, count]) => ({ role, count }),
+          );
+
+          return {
+            total,
+            totalCandidates: total,
+            shortlisted,
+            rejected,
+            manualReview,
+            pending,
+            assignedToHr1,
+            assignedToHr2,
+            unassigned,
+            roleBreakdown,
+          };
+        }
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to read stats from Google Sheets: ${err.message}`,
+        );
+      }
+    }
     return await this.candidateExcelService.getDashboardStats();
   }
 
   /**
-   * Retrieves paginated list of candidates from local Excel database with filtering and search.
+   * Retrieves paginated list of candidates from Google Sheets (or local historical backup) with filtering and search.
    */
   async findCandidates(query: CandidateQueryDto) {
+    if (this.googleSheetsService?.isConfigured()) {
+      try {
+        const rows = await this.googleSheetsService.readCandidateTrackerRows();
+        if (rows && rows.length > 0) {
+          let records = rows.map((r) =>
+            this.mapGoogleSheetRowToCandidateRecord(r),
+          );
+
+          if (query.role) {
+            const rLower = query.role.toLowerCase();
+            records = records.filter((c) =>
+              (c.jobRole || c.normalizedRole || '')
+                .toLowerCase()
+                .includes(rLower),
+            );
+          }
+          if (query.status) {
+            const sLower = query.status.toLowerCase();
+            records = records.filter((c) =>
+              (c.screeningStatus || c.applicationStatus || '')
+                .toLowerCase()
+                .includes(sLower),
+            );
+          }
+          if (query.assignedHr) {
+            const hrLower = query.assignedHr.toLowerCase();
+            records = records.filter((c) =>
+              (c.assignedHrName || '').toLowerCase().includes(hrLower),
+            );
+          }
+          if (query.search) {
+            const qLower = query.search.toLowerCase();
+            records = records.filter(
+              (c) =>
+                (c.name || '').toLowerCase().includes(qLower) ||
+                (c.email || '').toLowerCase().includes(qLower) ||
+                (c.phone || '').toLowerCase().includes(qLower) ||
+                (c.jobRole || '').toLowerCase().includes(qLower),
+            );
+          }
+
+          const total = records.length;
+          const anyQuery = query as any;
+          const limit = Math.max(
+            1,
+            Math.min(100, Number(anyQuery.limit || anyQuery.take) || 20),
+          );
+          const skip = Number(anyQuery.skip) || 0;
+          const page = anyQuery.page
+            ? Math.max(1, Number(anyQuery.page))
+            : Math.floor(skip / limit) + 1;
+          const candidates = records.slice(skip, skip + limit);
+
+          return {
+            candidates,
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+          };
+        }
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to find candidates from Google Sheets: ${err.message}`,
+        );
+      }
+    }
     return await this.candidateExcelService.findCandidates(query);
   }
 
-  /**
-   * Retrieves single candidate profile from local Excel database by ID.
-   */
   async getCandidateById(id: number) {
     if (!id || isNaN(id)) {
       throw new BadRequestException('Invalid candidate ID');
     }
 
+    if (this.googleSheetsService?.isConfigured()) {
+      try {
+        const sheetCandidate =
+          await this.googleSheetsService.findCandidateById(id);
+        if (sheetCandidate) {
+          return this.mapGoogleSheetRowToCandidateRecord(sheetCandidate);
+        }
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to fetch candidate ${id} from Google Sheets: ${err.message}`,
+        );
+      }
+    }
+
     const candidate = await this.candidateExcelService.getCandidateById(id);
 
     if (!candidate) {
-      throw new NotFoundException(
-        `Candidate with ID ${id} not found in Excel database`,
-      );
+      throw new NotFoundException(`Candidate with ID ${id} not found`);
     }
 
     return candidate;
@@ -864,15 +1388,6 @@ export class CandidateService extends BaseService {
         86400 * 90,
       );
     }
-
-    await this.candidateExcelService.saveCandidate({
-      id: candidate.id,
-      screeningStatus: candidate.screeningStatus,
-      applicationStatus: 'Replied',
-      hrRemarks: candidate.hrRemarks
-        ? `${candidate.hrRemarks} | [Candidate Replied]`
-        : '[Candidate Replied]',
-    });
 
     if (this.googleSheetsService.isConfigured()) {
       try {
@@ -1613,34 +2128,6 @@ Codes for Tomorrow`;
       }
     }
 
-    // 6. Update Excel authoritative candidate record
-    await this.candidateExcelService.saveCandidate({
-      id: candidate.id,
-      screeningStatus: candidate.screeningStatus,
-      applicationStatus: candidate.applicationStatus,
-      totalCallAttempts,
-      callCount: totalCallAttempts,
-      call1Date,
-      call1Status,
-      call1Remarks,
-      call2Date,
-      call2Status,
-      call2Remarks,
-      call3Date,
-      call3Status,
-      call3Remarks,
-      lastCallStatus,
-      lastContactDate: lastCallDate,
-      nextFollowUpDate,
-      call1DateAndStatus,
-      call2DateAndStatus,
-      call3DateAndStatus,
-      lastCallDate,
-      automatedFollowUpEmailStatus,
-      followUpEmailSentAt,
-      hrRemarks: updatedHrRemarks,
-    });
-
     // 7. Synchronize Google Sheets view (Requirements 6, 10)
     let sheetsSyncResult: any = null;
     if (this.googleSheetsService.isConfigured()) {
@@ -1926,52 +2413,6 @@ Codes for Tomorrow`;
             } catch {}
           }
 
-          // Rehydrate from candidate record if Redis cache is cold
-          if (attempts.length === 0) {
-            if (candidate.call1Status || candidate.call1Date) {
-              attempts.push({
-                attemptNumber: 1,
-                callDate: candidate.call1Date || new Date().toISOString(),
-                formattedCallDate:
-                  candidate.call1Date || this.formatServerDate(new Date()),
-                status:
-                  (candidate.call1Status as CallOutcome) || 'Not Answered',
-                notes: candidate.call1Remarks || undefined,
-                isQualifyingUnanswered: QUALIFYING_UNANSWERED_STATUSES.includes(
-                  candidate.call1Status || '',
-                ),
-              });
-            }
-            if (candidate.call2Status || candidate.call2Date) {
-              attempts.push({
-                attemptNumber: 2,
-                callDate: candidate.call2Date || new Date().toISOString(),
-                formattedCallDate:
-                  candidate.call2Date || this.formatServerDate(new Date()),
-                status:
-                  (candidate.call2Status as CallOutcome) || 'Not Answered',
-                notes: candidate.call2Remarks || undefined,
-                isQualifyingUnanswered: QUALIFYING_UNANSWERED_STATUSES.includes(
-                  candidate.call2Status || '',
-                ),
-              });
-            }
-            if (candidate.call3Status || candidate.call3Date) {
-              attempts.push({
-                attemptNumber: 3,
-                callDate: candidate.call3Date || new Date().toISOString(),
-                formattedCallDate:
-                  candidate.call3Date || this.formatServerDate(new Date()),
-                status:
-                  (candidate.call3Status as CallOutcome) || 'Not Answered',
-                notes: candidate.call3Remarks || undefined,
-                isQualifyingUnanswered: QUALIFYING_UNANSWERED_STATUSES.includes(
-                  candidate.call3Status || '',
-                ),
-              });
-            }
-          }
-
           // Reconcile calls from sheet (Attempts 1, 2, 3)
           const callsFromSheet = [
             {
@@ -2103,13 +2544,16 @@ Codes for Tomorrow`;
           const hrRemarksChanged =
             sheetRow.hrRemarks && sheetRow.hrRemarks !== candidate.hrRemarks;
 
-          if (
+          const hasTrackingFieldChange =
+            !lastSyncedHash ||
+            lastSyncedHash !== currentHash ||
             hasGenuineAttemptChange ||
             appStatusChanged ||
             roundChanged ||
             nextDateChanged ||
-            hrRemarksChanged
-          ) {
+            hrRemarksChanged;
+
+          if (hasTrackingFieldChange) {
             changedCandidatesCount++;
 
             // 1. Save updated call attempts in Redis
@@ -2240,44 +2684,28 @@ Codes for Tomorrow`;
                   'Candidate has replied or exited follow-up workflow'
                 ) {
                   automatedFollowUpEmailStatus = 'SKIPPED_REPLIED';
+                  try {
+                    await this.googleSheetsService.updateFollowUpEmailStatusInSheet(
+                      candidateId,
+                      'SKIPPED_REPLIED',
+                      this.formatHumanReadableDate(new Date()),
+                    );
+                  } catch (sheetUpdateErr: any) {
+                    this.logger.warn(
+                      `Failed to update skipped email status in Google Sheets for candidate ${candidateId}`,
+                      {
+                        cause:
+                          this.googleSheetsService.sanitizeError(
+                            sheetUpdateErr,
+                          ),
+                      },
+                    );
+                  }
                 }
               } else {
                 automatedFollowUpEmailStatus = 'FAILED_INVALID_EMAIL';
               }
             }
-
-            // 2. Synchronize Excel candidate record
-            await this.candidateExcelService.saveCandidate({
-              id: candidate.id,
-              screeningStatus: candidate.screeningStatus,
-              applicationStatus:
-                sheetRow.applicationStatus || candidate.applicationStatus,
-              currentInterviewRound:
-                sheetRow.currentInterviewRound ||
-                candidate.currentInterviewRound,
-              totalCallAttempts,
-              callCount: totalCallAttempts,
-              call1Date,
-              call1Status,
-              call1Remarks,
-              call2Date,
-              call2Status,
-              call2Remarks,
-              call3Date,
-              call3Status,
-              call3Remarks,
-              lastCallStatus,
-              lastContactDate: lastCallDate,
-              nextFollowUpDate:
-                sheetRow.nextFollowUpDate || candidate.nextFollowUpDate,
-              call1DateAndStatus,
-              call2DateAndStatus,
-              call3DateAndStatus,
-              lastCallDate,
-              automatedFollowUpEmailStatus,
-              followUpEmailSentAt,
-              hrRemarks: sheetRow.hrRemarks || candidate.hrRemarks,
-            });
 
             // 3. Update the synced hash in Redis to prevent loop
             const updatedRowForHash = {
@@ -2377,7 +2805,23 @@ Codes for Tomorrow`;
       reconciledInGoogleSheets: boolean;
     }>;
   }> {
-    const candidates = await this.candidateExcelService.getAllCandidates();
+    let candidates: any[] = [];
+    if (this.googleSheetsService?.isConfigured()) {
+      try {
+        const sheetRows =
+          await this.googleSheetsService.readCandidateTrackerRows();
+        candidates = sheetRows.map((row) =>
+          this.mapGoogleSheetRowToCandidateRecord(row),
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to read candidates from Google Sheets for HR reconciliation: ${err.message}`,
+        );
+      }
+    }
+    if (candidates.length === 0) {
+      candidates = await this.candidateExcelService.getAllCandidates();
+    }
     let reconciledCount = 0;
     let skippedCount = 0;
     const details: any[] = [];
@@ -2427,49 +2871,7 @@ Codes for Tomorrow`;
         `Reconciling misassigned recruitment candidate ID ${candidateId} (${candidate.name}, Score: ${score}) to ${hr2Name}`,
       );
 
-      let reconciledInExcel = false;
       let reconciledInGoogleSheets = false;
-
-      // 1. Update in Excel, preserving all call attempts and remarks
-      try {
-        await this.candidateExcelService.saveCandidate({
-          id: candidateId,
-          name: candidate.name,
-          email: candidate.email,
-          phone: candidate.phone,
-          jobRole: candidate.jobRole,
-          assignedHrName: hr2Name,
-          assignedHrEmail: hr2Email,
-          screeningStatus: candidate.screeningStatus,
-          applicationStatus: candidate.applicationStatus,
-          matchScore: candidate.matchScore,
-          summary: candidate.summary,
-          hrRemarks: candidate.hrRemarks,
-          rejectionReason: candidate.rejectionReason,
-          currentInterviewRound: candidate.currentInterviewRound,
-          totalCallAttempts: candidate.totalCallAttempts,
-          call1Date: candidate.call1Date,
-          call1Status: candidate.call1Status,
-          call1Remarks: candidate.call1Remarks,
-          call2Date: candidate.call2Date,
-          call2Status: candidate.call2Status,
-          call2Remarks: candidate.call2Remarks,
-          call3Date: candidate.call3Date,
-          call3Status: candidate.call3Status,
-          call3Remarks: candidate.call3Remarks,
-          lastCallStatus: candidate.lastCallStatus,
-          lastContactDate: candidate.lastContactDate,
-          nextFollowUpDate: candidate.nextFollowUpDate,
-          automatedFollowUpEmailStatus: candidate.automatedFollowUpEmailStatus,
-          followUpEmailSentAt: candidate.followUpEmailSentAt,
-        });
-        reconciledInExcel = true;
-      } catch (excelErr: any) {
-        this.logger.error(
-          `Failed to update Excel record for candidate ID ${candidateId}`,
-          { cause: excelErr.message },
-        );
-      }
 
       // 2. Update in Google Sheets, preserving existing tracking fields
       if (this.googleSheetsService.isConfigured()) {
@@ -2521,7 +2923,7 @@ Codes for Tomorrow`;
         matchScore: score,
         oldHr: currentHrName || 'Manual Review',
         newHr: hr2Name,
-        reconciledInExcel,
+        reconciledInExcel: false,
         reconciledInGoogleSheets,
       });
     }
@@ -2537,6 +2939,376 @@ Codes for Tomorrow`;
       reconciled: reconciledCount,
       skipped: skippedCount,
       details,
+    };
+  }
+  public async updateCandidateTracking(
+    candidateId: number,
+    dto: UpdateCandidateTrackingDto,
+    user?: any,
+  ): Promise<{
+    success: boolean;
+    candidateId: number;
+    updated: any;
+  }> {
+    if (!candidateId || isNaN(candidateId)) {
+      throw new BadRequestException('Invalid candidate ID');
+    }
+
+    const candidate = await this.getCandidateById(candidateId);
+
+    // Permission check: Admin can update any; HR can update candidates assigned to them
+    const isUserAdmin = user?.type === 'admin' || user?.role === 'Admin';
+    const userIdentifier = (
+      user?.name ||
+      user?.email ||
+      user?.username ||
+      ''
+    ).toLowerCase();
+    const assignedName = (candidate.assignedHrName || '').toLowerCase();
+    const assignedEmail = (candidate.assignedHrEmail || '').toLowerCase();
+
+    if (!isUserAdmin && userIdentifier) {
+      const isOwner =
+        (assignedName && userIdentifier.includes(assignedName)) ||
+        (assignedEmail && userIdentifier === assignedEmail) ||
+        (user?.name && user.name.toLowerCase() === assignedName);
+
+      if (!isOwner) {
+        throw new ForbiddenException(
+          'You do not have permission to update this record. Only its owner or a manager/admin can.',
+        );
+      }
+    }
+
+    const lastUpdatedBy = user?.name || user?.email || 'Headquarter Portal';
+    const lastUpdatedAt = new Date().toISOString().split('T')[0];
+
+    const updates: any = {
+      id: candidate.id,
+      screeningStatus: candidate.screeningStatus,
+      applicationStatus: candidate.applicationStatus,
+      lastUpdatedBy,
+      lastUpdatedAt,
+    };
+
+    if (dto.currentInterviewRound) {
+      updates.currentInterviewRound = dto.currentInterviewRound;
+    }
+    if (dto.hrRemarks) {
+      updates.hrRemarks = dto.hrRemarks;
+    }
+
+    const key =
+      dto.key ||
+      (dto.callbackStatus ? 'status' : dto.callStatus ? 'call' : undefined);
+    const value = dto.value || dto.callbackStatus || dto.callStatus;
+
+    if (key === 'status' || dto.callbackStatus !== undefined) {
+      const statusVal = dto.callbackStatus || dto.value || '';
+      if (statusVal === 'Completed') {
+        updates.currentInterviewRound =
+          candidate.currentInterviewRound === 'Not Started'
+            ? 'HR Round'
+            : candidate.currentInterviewRound;
+        updates.call1Status = 'Answered';
+      } else if (statusVal === 'Missed') {
+        updates.call1Status = 'Not Answered';
+      }
+      if (this.redisService?.client) {
+        try {
+          await this.redisService.client.set(
+            `candidate:tracking:status:${candidateId}`,
+            statusVal,
+            'EX',
+            86400 * 30,
+          );
+        } catch {}
+      }
+    }
+
+    if (key === 'call' || dto.callStatus !== undefined) {
+      const callVal = dto.callStatus || dto.value || '';
+      if (this.redisService?.client) {
+        try {
+          await this.redisService.client.set(
+            `candidate:tracking:call:${candidateId}`,
+            callVal,
+            'EX',
+            86400 * 30,
+          );
+        } catch {}
+      }
+    }
+
+    if (this.googleSheetsService.isConfigured()) {
+      try {
+        await this.googleSheetsService.saveCandidate(updates);
+      } catch (err: any) {
+        this.logger.error(
+          `Failed to save candidate tracking update to Google Sheets for ID ${candidateId}: ${err.message}`,
+        );
+        throw new InternalServerErrorException(
+          'Google Sheets is temporarily unavailable. Could not save update.',
+        );
+      }
+    }
+
+    return {
+      success: true,
+      candidateId,
+      updated: {
+        key,
+        value,
+        lastUpdatedBy,
+        lastUpdatedAt,
+        ...dto,
+      },
+    };
+  }
+
+  /**
+   * Safe, idempotent backfill process to link existing Google Sheets candidates to their Drive CVs.
+   * - Finds rows in Google Sheets where Col AA (CV Link) and/or Col AB (Drive File ID) are empty.
+   * - Confidently matches candidates to existing Drive files or original Gmail attachments.
+   * - Only updates Columns AA:AB using updateCandidateDriveColumns() to guarantee columns A:Z are untouched.
+   * - If a candidate cannot be confidently matched, leaves cells unchanged and marks for MANUAL_REVIEW.
+   * - Defaults to dryRun: true (safe mode) so proposed changes can be inspected without modifying production data.
+   */
+  public async planOrExecuteDriveBackfill(options?: {
+    dryRun?: boolean;
+    limit?: number;
+  }): Promise<{
+    dryRun: boolean;
+    totalRowsInspected: number;
+    alreadyPopulatedCount: number;
+    matchedCount: number;
+    manualReviewCount: number;
+    results: Array<{
+      candidateId: number;
+      rowNumber: number;
+      candidateName: string;
+      email: string;
+      role: string;
+      action: 'MATCHED' | 'MANUAL_REVIEW' | 'ALREADY_POPULATED';
+      matchedFileId?: string;
+      matchedCvLink?: string;
+      source?: 'EXISTING_DRIVE_FILE' | 'GMAIL_ATTACHMENT_REUPLOAD';
+      reason?: string;
+    }>;
+  }> {
+    const isDryRun = options?.dryRun !== false; // Default: true for safety
+    const limit = options?.limit || 100;
+
+    if (!this.googleSheetsService.isConfigured()) {
+      throw new Error('Google Sheets is not configured');
+    }
+
+    const trackerRows =
+      await this.googleSheetsService.readCandidateTrackerRows();
+    const results: Array<{
+      candidateId: number;
+      rowNumber: number;
+      candidateName: string;
+      email: string;
+      role: string;
+      action: 'MATCHED' | 'MANUAL_REVIEW' | 'ALREADY_POPULATED';
+      matchedFileId?: string;
+      matchedCvLink?: string;
+      source?: 'EXISTING_DRIVE_FILE' | 'GMAIL_ATTACHMENT_REUPLOAD';
+      reason?: string;
+    }> = [];
+
+    let alreadyPopulatedCount = 0;
+    let matchedCount = 0;
+    let manualReviewCount = 0;
+
+    // Load available Drive files if Drive service is available and configured
+    let driveFiles: any[] = [];
+    if (this.googleDriveService?.isConfigured()) {
+      try {
+        driveFiles = await this.googleDriveService.scanNewCvFiles({
+          includeProcessed: true,
+        });
+      } catch (err: any) {
+        this.logger.warn(
+          `Could not pre-scan Drive files during backfill: ${err.message}`,
+        );
+      }
+    }
+
+    // Load queue jobs if available
+    const screeningJobsFile = path.resolve(
+      process.cwd(),
+      'data',
+      process.env.NODE_ENV === 'test'
+        ? 'screening-jobs.test.json'
+        : 'screening-jobs.json',
+    );
+    let queueJobs: any[] = [];
+    if (fs.existsSync(screeningJobsFile)) {
+      try {
+        queueJobs = JSON.parse(fs.readFileSync(screeningJobsFile, 'utf-8'));
+      } catch {}
+    }
+
+    for (const trackerRow of trackerRows.slice(0, limit)) {
+      const {
+        candidateId,
+        candidateName,
+        email,
+        jobRole,
+        driveFileId,
+        cvLink,
+      } = trackerRow;
+      const rowNumber = (trackerRow as any).rowNumber || trackerRow.rowIndex;
+
+      // 1. Idempotency check: If already populated with valid link and file ID, skip
+      if (driveFileId && driveFileId.trim() && cvLink && cvLink.trim()) {
+        alreadyPopulatedCount++;
+        results.push({
+          candidateId,
+          rowNumber,
+          candidateName,
+          email,
+          role: jobRole,
+          action: 'ALREADY_POPULATED',
+          matchedFileId: driveFileId,
+          matchedCvLink: cvLink,
+        });
+        continue;
+      }
+
+      // 2. Attempt confident match via existing Drive files
+      let matchedFileId: string | undefined;
+      let matchedCvLink: string | undefined;
+      let matchSource:
+        | 'EXISTING_DRIVE_FILE'
+        | 'GMAIL_ATTACHMENT_REUPLOAD'
+        | undefined;
+
+      const normEmail = (email || '').trim().toLowerCase();
+
+      // Check drive files by name (Candidate_{id}_)
+      if (driveFiles.length > 0) {
+        const fileMatch = driveFiles.find((f) => {
+          const lowerName = f.name.toLowerCase();
+          return lowerName.includes(`candidate_${candidateId}_`);
+        });
+
+        if (fileMatch) {
+          matchedFileId = fileMatch.fileId;
+          matchedCvLink = `=HYPERLINK("https://drive.google.com/file/d/${matchedFileId}/view", "View CV")`;
+          matchSource = 'EXISTING_DRIVE_FILE';
+        }
+      }
+
+      // 3. If no Drive file found, check if original Gmail resume attachment can be confidently identified
+      if (!matchedFileId && queueJobs.length > 0 && normEmail) {
+        const matchingJob = queueJobs.find(
+          (j) =>
+            j.sender?.email?.trim().toLowerCase() === normEmail ||
+            (j.candidateId !== undefined && j.candidateId === candidateId),
+        );
+
+        if (matchingJob?.driveFileId) {
+          matchedFileId = matchingJob.driveFileId;
+          matchedCvLink =
+            matchingJob.cvLink ||
+            `=HYPERLINK("https://drive.google.com/file/d/${matchedFileId}/view", "View CV")`;
+          matchSource = 'EXISTING_DRIVE_FILE';
+        } else if (
+          matchingJob?.messageId &&
+          matchingJob?.attachmentId &&
+          this.googleDriveService?.isConfigured()
+        ) {
+          if (!isDryRun) {
+            try {
+              const buffer = await this.gmailService.downloadAttachment(
+                matchingJob.messageId,
+                matchingJob.attachmentId,
+              );
+              if (buffer && buffer.length > 0) {
+                const uploadResult = await this.googleDriveService.uploadCv({
+                  buffer,
+                  filename: matchingJob.filename,
+                  mimeType: matchingJob.mimeType,
+                  candidateId,
+                  candidateEmail: email,
+                  candidateName,
+                  role: jobRole,
+                });
+                matchedFileId = uploadResult.fileId;
+                matchedCvLink = uploadResult.cvLink;
+                matchSource = 'GMAIL_ATTACHMENT_REUPLOAD';
+                await this.googleDriveService.markFileProcessed(
+                  uploadResult.fileId,
+                  candidateId,
+                );
+              }
+            } catch (upErr: any) {
+              this.logger.warn(
+                `Backfill upload failed for candidate ID ${candidateId}: ${upErr.message}`,
+              );
+            }
+          } else {
+            // In dry-run mode, simulate proposed match via Gmail attachment
+            matchedFileId = `[PROPOSED_DRIVE_UPLOAD_FROM_GMAIL:${matchingJob.messageId}]`;
+            matchedCvLink = `=HYPERLINK("[PROPOSED_VIEW_CV]", "View CV")`;
+            matchSource = 'GMAIL_ATTACHMENT_REUPLOAD';
+          }
+        }
+      }
+
+      // 4. If matched and not dry-run, execute the safe Google Sheets AA:AB write
+      if (matchedFileId && matchedCvLink) {
+        if (!isDryRun && matchSource !== undefined) {
+          try {
+            await this.googleSheetsService.updateCandidateDriveColumns(
+              rowNumber,
+              matchedFileId,
+              matchedCvLink,
+            );
+          } catch (writeErr: any) {
+            this.logger.error(
+              `Failed writing Drive columns for candidate ${candidateId} at row ${rowNumber}: ${writeErr.message}`,
+            );
+          }
+        }
+
+        matchedCount++;
+        results.push({
+          candidateId,
+          rowNumber,
+          candidateName,
+          email,
+          role: jobRole,
+          action: 'MATCHED',
+          matchedFileId,
+          matchedCvLink,
+          source: matchSource,
+        });
+      } else {
+        manualReviewCount++;
+        results.push({
+          candidateId,
+          rowNumber,
+          candidateName,
+          email,
+          role: jobRole,
+          action: 'MANUAL_REVIEW',
+          reason:
+            'Could not confidently match candidate to a Drive file or Gmail attachment',
+        });
+      }
+    }
+
+    return {
+      dryRun: isDryRun,
+      totalRowsInspected: trackerRows.length,
+      alreadyPopulatedCount,
+      matchedCount,
+      manualReviewCount,
+      results,
     };
   }
 }

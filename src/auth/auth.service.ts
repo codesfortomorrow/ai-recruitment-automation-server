@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { JwtService, JwtSignOptions } from '@nestjs/jwt';
-import { JwtPayload, UserType } from '@Common';
+import { JwtPayload, UserType, ValidatedUser } from '@Common';
 import { SendCodeRequestType } from './dto';
 import { UsersService } from '../users';
 import {
@@ -76,15 +76,16 @@ export class AuthService {
     throw new Error('Unknown send code request type found');
   }
 
-  async login(userId: number, type: UserType): Promise<ValidAuthResponse> {
+  async login(user: ValidatedUser): Promise<ValidAuthResponse> {
     const { token, expiresIn } = await this.generateJwt({
-      sub: userId,
-      type,
+      sub: user.id,
+      type: UserType.User,
     });
+
     return {
       accessToken: token,
       expiresIn,
-      type,
+      type: UserType.User,
     };
   }
 

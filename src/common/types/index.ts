@@ -73,6 +73,26 @@ export class EnvironmentVariables {
   @Min(1)
   @Max(65535)
   METRICS_PORT?: number;
+
+  @IsOptional()
+  @IsString()
+  GOOGLE_DRIVE_CV_FOLDER_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  SLACK_CLIENT_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  SLACK_CLIENT_SECRET?: string;
+
+  @IsOptional()
+  @IsString()
+  SLACK_REDIRECT_URI?: string;
+
+  @IsOptional()
+  @IsString()
+  FRONTEND_URL?: string;
 }
 
 /**

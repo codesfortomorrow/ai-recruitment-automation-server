@@ -10,6 +10,7 @@ import { ResumeFingerprintService } from './resume-fingerprint.service';
 import { ResumeScreeningQueueService } from './resume-screening-queue.service';
 import { ResumeScreeningWorkerService } from './resume-screening-worker.service';
 import { RoleDetectionService } from './role-detection.service';
+import { RecruitmentEmailClassifierService } from './recruitment-email-classifier.service';
 import { MailController } from './mail.controller';
 import { QueueModule } from '../queue';
 import { RedisModule } from '../redis';
@@ -33,6 +34,7 @@ import { CandidateModule } from '../candidate';
     ResumeScreeningQueueService,
     ResumeScreeningWorkerService,
     RoleDetectionService,
+    RecruitmentEmailClassifierService,
   ],
   exports: [
     MailService,
@@ -42,6 +44,7 @@ import { CandidateModule } from '../candidate';
     ResumeScreeningQueueService,
     ResumeScreeningWorkerService,
     RoleDetectionService,
+    RecruitmentEmailClassifierService,
   ],
 })
 export class MailModule implements OnApplicationShutdown {

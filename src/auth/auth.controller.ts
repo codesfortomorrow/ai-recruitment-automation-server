@@ -9,32 +9,46 @@ import {
   Body,
   BadRequestException,
   UnprocessableEntityException,
+  UnauthorizedException,
+  ForbiddenException,
+  ServiceUnavailableException,
   Get,
   Redirect,
+  Query,
 } from '@nestjs/common';
 import { CookieOptions, Request, Response } from 'express';
 import {
   ApiBearerAuth,
   ApiBody,
   ApiExcludeEndpoint,
+  ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
 import { ConfigType } from '@nestjs/config';
 import {
+  AccessGuard,
   AuthenticatedRequest,
   BaseController,
   JwtAuthGuard,
+  LoggerService,
   UserType,
   UtilsService,
   ValidatedUser,
 } from '@Common';
-import { appConfigFactory, authConfigFactory } from '@Config';
+import {
+  appConfigFactory,
+  authConfigFactory,
+  slackConfigFactory,
+} from '@Config';
 import {
   AuthService,
   InvalidVerifyCodeResponse,
   ValidAuthResponse,
 } from './auth.service';
-import { GoogleOAuthGuard, LocalAuthGuard } from './guards';
+// import { SlackOAuthService } from '/slack-oauth.service';
+import { GoogleOAuthGuard, LocalAuthGuard, SlackOAuthGuard } from './guards';
+import { AdminService } from '../admin';
+import { UsersService } from '../users';
 import {
   ForgotPasswordRequestDto,
   RegisterUserRequestDto,
@@ -53,18 +67,31 @@ export class AuthController extends BaseController {
     private readonly appConfig: ConfigType<typeof appConfigFactory>,
     @Inject(authConfigFactory.KEY)
     private readonly config: ConfigType<typeof authConfigFactory>,
+    @Inject(slackConfigFactory.KEY)
+    private readonly slackConfig: ConfigType<typeof slackConfigFactory>,
     private readonly authService: AuthService,
+    // private readonly slackOAuthService: SlackOAuthService,
+    private readonly adminService: AdminService,
+    private readonly usersService: UsersService,
     private readonly utilsService: UtilsService,
   ) {
     super();
+  }
+
+  private getSafeCookieDomain(explicitDomain?: string): string | undefined {
+    const domain =
+      explicitDomain !== undefined ? explicitDomain : this.appConfig?.domain;
+    if (!domain || domain === 'localhost' || domain === '127.0.0.1') {
+      return undefined;
+    }
+    return domain;
   }
 
   private getCookieOptions(options?: CookieOptions) {
     const isProduction = this.utilsService.isProduction();
     return {
       expires: options?.expires,
-      domain:
-        options?.domain !== undefined ? options.domain : this.appConfig.domain,
+      domain: this.getSafeCookieDomain(options?.domain),
       httpOnly: options?.httpOnly !== undefined ? options.httpOnly : true,
       sameSite:
         options?.sameSite !== undefined
@@ -97,17 +124,14 @@ export class AuthController extends BaseController {
     return this.utilsService.getCookiePrefix(ut) + 'authToken';
   }
 
-  private setAuthCookie(
-    res: Response,
-    accessToken: string,
-    userType: UserType,
-    expiresIn: number,
-  ): void {
-    const expirationTime = new Date(Date.now() + expiresIn * 1000);
-
-    this.setCookie(res, this.getAuthCookie(userType), accessToken, {
-      expires: expirationTime,
-    });
+  private setAuthCookies(res: Response, accessToken: string): void {
+    res.cookie(
+      'authToken',
+      accessToken,
+      this.getCookieOptions({
+        expires: this.config.authCookieExpirationTime(),
+      }),
+    );
   }
 
   @Post('send-code')
@@ -164,48 +188,115 @@ export class AuthController extends BaseController {
     }
 
     const { accessToken, expiresIn, type } = response as ValidAuthResponse;
-    this.setAuthCookie(res, accessToken, type, expiresIn);
+    this.setAuthCookies(res, accessToken);
     return { accessToken, expiresIn, type };
   }
 
-  @ApiBody({ type: () => LoginRequestDto })
-  @UseGuards(LocalAuthGuard)
-  @HttpCode(200)
-  @Post('login')
-  async login(
-    @Req() req: Request & { user: ValidatedUser },
-    @Res({ passthrough: true }) res: Response,
-  ) {
-    const { accessToken, expiresIn, type } = await this.authService.login(
-      req.user.id,
-      req.user.type,
-    );
-    this.setAuthCookie(res, accessToken, type, expiresIn);
-    return { accessToken, expiresIn, type };
-  }
+  // @ApiBody({ type: () => LoginRequestDto })
+  // @UseGuards(LocalAuthGuard)
+  // @HttpCode(200)
+  // @Post('login')
+  // async login(
+  //   @Req() req: Request & { user: ValidatedUser },
+  //   @Res({ passthrough: true }) res: Response,
+  // ) {
+  //   const { accessToken, expiresIn, type } = await this.authService.login(
+  //     req.user.id,
+  //     req.user.type,
+  //   );
+  //   this.setAuthCookie(res, accessToken, type, expiresIn);
+  //   return { accessToken, expiresIn, type };
+  // }
 
-  @UseGuards(GoogleOAuthGuard)
-  @Get('google')
-  googleOAuth() {}
+  // @ApiOperation({
+  //   summary: 'Initiate Google OAuth 2.0 login flow',
+  //   description:
+  //     'Initiates Google OAuth 2.0 authorization by redirecting the browser to Google accounts login. **Note:** This endpoint issues an HTTP 302 browser redirect. Do not execute via Swagger UI AJAX "Execute" button (browser fetch will be blocked by Google CORS policy). Test via browser navigation or link: [Open /auth/google](/auth/google)',
+  // })
+  // @UseGuards(GoogleOAuthGuard)
+  // @Get('google')
+  // googleOAuth() {}
 
+  // @ApiExcludeEndpoint()
+  // @UseGuards(GoogleOAuthGuard)
+  // @Get('google/callback')
+  // @Redirect()
+  // async googleWebOAuthCallback(
+  //   @Req() req: Request & { user: ValidatedUser },
+  //   @Res({ passthrough: true }) res: Response,
+  // ) {
+  //   const { accessToken, expiresIn, type } = await this.authService.login(
+  //     req.user.id,
+  //     req.user.type,
+  //   );
+  //   this.setAuthCookie(res, accessToken, type, expiresIn);
+  //   return {
+  //     url: this.appConfig.appWebUrl as string,
+  //   };
+  // }
+
+  @ApiOperation({
+    summary: 'Initiate Slack OAuth login flow',
+    description:
+      'Initiates Slack OAuth authorization by generating a CSRF state cookie and redirecting the browser to Slack. **Note:** This endpoint issues an HTTP 302 browser redirect. Do not execute via Swagger UI AJAX "Execute" button (browser fetch will be blocked by Slack CORS policy). Test via browser navigation or link: [Open /auth/slack](/auth/slack)',
+  })
+  @UseGuards(SlackOAuthGuard)
+  @Get('slack')
+  slackLogin() {}
+
+  /** Slack redirects back here after the user approves access. */
   @ApiExcludeEndpoint()
-  @UseGuards(GoogleOAuthGuard)
-  @Get('google/callback')
+  @UseGuards(SlackOAuthGuard)
+  @Get('slack/callback')
   @Redirect()
-  async googleWebOAuthCallback(
+  async slackCallback(
     @Req() req: Request & { user: ValidatedUser },
     @Res({ passthrough: true }) res: Response,
   ) {
-    const { accessToken, expiresIn, type } = await this.authService.login(
-      req.user.id,
-      req.user.type,
-    );
-    this.setAuthCookie(res, accessToken, type, expiresIn);
+    const { accessToken } = await this.authService.login(req.user);
+
+    this.setAuthCookies(res, accessToken);
+
+    return { url: this.appConfig.appWebUrl as string };
+  }
+
+  @ApiOperation({ summary: 'Verify and retrieve current session profile' })
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, AccessGuard)
+  @Get('session')
+  async getSession(@Req() req: AuthenticatedRequest) {
+    const ctx = this.getContext(req);
+    let profile: any = null;
+    if (ctx.user.type === UserType.Admin) {
+      profile = await this.adminService.getProfile(ctx.user.id);
+    } else {
+      profile = await this.usersService.getProfile(ctx.user.id);
+    }
     return {
-      url: this.appConfig.appWebUrl as string,
+      authenticated: true,
+      user: {
+        id: ctx.user.id,
+        type: ctx.user.type,
+        email: profile?.email,
+        firstname: profile?.firstname,
+        lastname: profile?.lastname,
+        profileImage: profile?.profileImage,
+        status: profile?.status,
+      },
     };
   }
 
+  @ApiOperation({
+    summary: 'Alias to verify and retrieve current session profile',
+  })
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, AccessGuard)
+  @Get('me')
+  async getMe(@Req() req: AuthenticatedRequest) {
+    return this.getSession(req);
+  }
+
+  @ApiOperation({ summary: 'Log out current user and clear session cookie' })
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Post('logout')
@@ -221,7 +312,9 @@ export class AuthController extends BaseController {
   @Post('forgot-password')
   @HttpCode(200)
   async forgotPassword(@Body() data: ForgotPasswordRequestDto) {
-    if (!data.email && !data.mobile) throw BadRequestException;
+    if (!data.email && !data.mobile) {
+      throw new BadRequestException('Email or mobile number is required');
+    }
     return await this.authService.forgotPassword(data.email, data.mobile);
   }
 

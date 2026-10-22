@@ -8,6 +8,7 @@ import { HrAssignmentService } from './hr-assignment.service';
 import { CandidateNotificationService } from './candidate-notification.service';
 import { CandidateExcelService } from './candidate-excel.service';
 import { GoogleSheetsService } from './google-sheets.service';
+import { GoogleDriveService } from './google-drive.service';
 
 @Module({
   imports: [PrismaModule, RedisModule, forwardRef(() => MailModule)],
@@ -18,6 +19,7 @@ import { GoogleSheetsService } from './google-sheets.service';
     CandidateNotificationService,
     CandidateExcelService,
     GoogleSheetsService,
+    GoogleDriveService,
   ],
   exports: [
     CandidateService,
@@ -25,6 +27,7 @@ import { GoogleSheetsService } from './google-sheets.service';
     CandidateNotificationService,
     CandidateExcelService,
     GoogleSheetsService,
+    GoogleDriveService,
   ],
 })
 export class CandidateModule {}

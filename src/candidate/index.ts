@@ -6,6 +6,7 @@ export * from './candidate-notification.service';
 export * from './candidate-excel.service';
 export * from './candidate-excel-sync.service';
 export * from './google-sheets.service';
+export * from './google-drive.service';
 export * from './candidate.module';
 export * from './dto/candidate-query.dto';
 export * from './dto/run-excel-sync.dto';

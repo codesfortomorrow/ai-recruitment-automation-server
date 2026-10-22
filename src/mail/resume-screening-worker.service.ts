@@ -3,6 +3,7 @@ import {
   Inject,
   Injectable,
   OnModuleInit,
+  OnApplicationShutdown,
   Optional,
 } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
@@ -12,6 +13,7 @@ import { geminiConfigFactory } from '@Config';
 import { GeminiService } from './gemini.service';
 import { ResumeFingerprintService } from './resume-fingerprint.service';
 import { CandidateService } from '../candidate/candidate.service';
+import { GoogleSheetsService } from '../candidate/google-sheets.service';
 import { ResumeScreeningQueueService } from './resume-screening-queue.service';
 import { ScreeningJob } from './gemini.types';
 import { calculateBackoffWithJitter } from './gemini-error.classifier';
@@ -21,9 +23,10 @@ import { GmailService } from './gmail.service';
 @Injectable()
 export class ResumeScreeningWorkerService
   extends BaseService
-  implements OnModuleInit
+  implements OnModuleInit, OnApplicationShutdown
 {
   private isProcessing = false;
+  private isShuttingDown = false;
 
   constructor(
     private readonly queueService: ResumeScreeningQueueService,
@@ -34,6 +37,9 @@ export class ResumeScreeningWorkerService
     @Optional()
     @Inject(forwardRef(() => CandidateService))
     private readonly candidateService?: CandidateService,
+    @Optional()
+    @Inject(forwardRef(() => GoogleSheetsService))
+    private readonly googleSheetsService?: GoogleSheetsService,
     @Optional()
     @Inject(forwardRef(() => GmailService))
     private readonly gmailService?: GmailService,
@@ -56,6 +62,11 @@ export class ResumeScreeningWorkerService
     );
   }
 
+  async onApplicationShutdown(): Promise<void> {
+    this.isShuttingDown = true;
+    this.logger.info('ResumeScreeningWorkerService shutting down gracefully');
+  }
+
   /**
    * Periodic cron trigger for processing pending and retry-waiting screening jobs.
    * Runs every 10 seconds (or configured interval).
@@ -63,7 +74,7 @@ export class ResumeScreeningWorkerService
    */
   @Cron(CronExpression.EVERY_10_SECONDS)
   async processDueJobsCron(): Promise<void> {
-    if (this.isProcessing) {
+    if (this.isProcessing || this.isShuttingDown) {
       return;
     }
 
@@ -214,7 +225,111 @@ export class ResumeScreeningWorkerService
         }
       }
 
-      // 5. Execute Gemini Analysis using already extracted resume text (NO PDF/DOCX re-download or re-parse unless insufficient!)
+      // 5. Pre-check: If candidate row is already persisted in Google Sheets (e.g. crash after Sheets write, or notification retry)
+      let existingInSheets: any = null;
+      if (this.googleSheetsService?.isConfigured()) {
+        try {
+          if (currentJob.candidateId) {
+            existingInSheets = await this.googleSheetsService.findCandidateById(
+              currentJob.candidateId,
+            );
+          }
+          if (!existingInSheets && currentJob.driveFileId) {
+            const driveMatch =
+              await this.googleSheetsService.findCandidateByDriveFileId(
+                currentJob.driveFileId,
+              );
+            if (driveMatch?.candidateId) {
+              existingInSheets =
+                await this.googleSheetsService.findCandidateById(
+                  Number(driveMatch.candidateId),
+                );
+            }
+          }
+          if (!existingInSheets && currentJob.sender?.email) {
+            existingInSheets =
+              await this.googleSheetsService.findCandidateByEmail(
+                currentJob.sender.email,
+              );
+          }
+        } catch (findErr: any) {
+          this.logger.warn(
+            `Failed checking existing Google Sheets candidate: ${findErr.message}`,
+          );
+        }
+      }
+
+      if (existingInSheets && this.candidateService) {
+        this.logger.info(
+          `Candidate already persisted in Google Sheets (ID: ${existingInSheets.candidateId}) for job ${currentJob.id}. Reconciling without re-screening.`,
+        );
+        const candidateId = existingInSheets.candidateId;
+        currentJob.candidateId = candidateId;
+
+        // If candidate already exists in Google Sheets but is missing Drive columns (AA and AB),
+        // and currentJob has driveFileId, safely backfill columns AA and AB without altering columns A:Z
+        if (
+          (!existingInSheets.driveFileId || !existingInSheets.cvLink) &&
+          currentJob.driveFileId &&
+          this.googleSheetsService?.isConfigured()
+        ) {
+          try {
+            await this.googleSheetsService.updateCandidateDriveColumns(
+              existingInSheets.rowNumber,
+              currentJob.driveFileId,
+              currentJob.cvLink,
+            );
+            existingInSheets.driveFileId = currentJob.driveFileId;
+            existingInSheets.cvLink = currentJob.cvLink;
+          } catch (driveSyncErr: any) {
+            this.logger.warn(
+              `Failed to sync Drive columns for existing candidate ${existingInSheets.candidateId}: ${driveSyncErr.message}`,
+            );
+          }
+        }
+
+        const candidateRecord =
+          this.candidateService.mapGoogleSheetRowToCandidateRecord(
+            existingInSheets,
+          );
+        const notifResult =
+          await this.candidateService.dispatchNotification(candidateRecord);
+
+        if (notifResult.sent) {
+          await this.resumeFingerprintService.markFingerprintProcessed(
+            currentJob.fingerprint,
+            {
+              candidateId,
+              gmailMessageId: currentJob.messageId,
+              attachmentId: currentJob.attachmentId,
+              filename: currentJob.filename,
+              senderEmail: currentJob.sender.email,
+              processedAt: new Date().toISOString(),
+              status: 'COMPLETED',
+            },
+          );
+          currentJob.status = 'COMPLETED';
+          currentJob.completedAt = new Date().toISOString();
+          currentJob.lastError = undefined;
+          await this.queueService.updateJob(currentJob);
+          return currentJob;
+        } else {
+          currentJob.status = 'NOTIFICATION_PENDING';
+          currentJob.lastError =
+            notifResult.error || 'Notification dispatch failed';
+          currentJob.attemptCount += 1;
+          const delayMs = calculateBackoffWithJitter(
+            currentJob.attemptCount,
+            this.config.initialRetryDelayMs || 2000,
+            this.config.maxRetryDelayMs || 60000,
+          );
+          currentJob.nextRetryAt = Date.now() + delayMs;
+          await this.queueService.updateJob(currentJob);
+          return currentJob;
+        }
+      }
+
+      // 6. Execute Gemini Analysis using already extracted resume text (NO PDF/DOCX re-download or re-parse unless insufficient!)
       const analysisResult = await this.geminiService.analyzeApplication({
         messageId: currentJob.messageId,
         subject: currentJob.subject,
@@ -230,7 +345,7 @@ export class ResumeScreeningWorkerService
 
       analysisResult.fingerprint = currentJob.fingerprint;
 
-      // 6. Handle Analysis Result
+      // 7. Handle Analysis Result
       if (analysisResult.status === 'success' && analysisResult.analysis) {
         // AI screening succeeded!
         let candidateId: number | undefined;
@@ -264,19 +379,105 @@ export class ResumeScreeningWorkerService
                 status: 'success',
                 text: currentJob.extractedResumeText,
                 fingerprint: currentJob.fingerprint,
+                driveFileId: currentJob.driveFileId,
+                cvLink: currentJob.cvLink,
               },
             ],
           };
 
-          const candidateRecord =
+          const candidateRecord: any =
             await this.candidateService.persistAndProcessScreeningResult({
               messageDetail: mockDetail,
               analysisResult,
               candidateId: currentJob.candidateId,
               forceUpdate: true,
+              driveFileId: currentJob.driveFileId,
+              cvLink: currentJob.cvLink,
             });
 
           candidateId = candidateRecord?.id || currentJob.candidateId;
+
+          // If CandidateService uploaded to Drive and acquired a new driveFileId, update the queue job
+          if (candidateRecord?.driveFileId && !currentJob.driveFileId) {
+            currentJob.driveFileId = candidateRecord.driveFileId;
+            currentJob.cvLink = candidateRecord.cvLink;
+            await this.queueService.updateJob(currentJob);
+          }
+
+          // Confirm that Google Sheets has successfully persisted the correct candidate row
+          if (!candidateRecord?.sheetsSaved) {
+            currentJob.attemptCount += 1;
+            currentJob.status = 'FAILED_RETRYABLE';
+            currentJob.candidateId = candidateId;
+            currentJob.lastError =
+              candidateRecord?.sheetsError ||
+              'Google Sheets persistence failed';
+
+            const delayMs = calculateBackoffWithJitter(
+              currentJob.attemptCount,
+              this.config.initialRetryDelayMs || 2000,
+              this.config.maxRetryDelayMs || 60000,
+            );
+            currentJob.nextRetryAt = Date.now() + delayMs;
+            await this.queueService.updateJob(currentJob);
+
+            this.logger.warn(
+              `Job ${currentJob.id} could not persist to Google Sheets; marked FAILED_RETRYABLE for retry`,
+              { jobId: currentJob.id, cause: currentJob.lastError },
+            );
+            return currentJob;
+          }
+
+          // If Google Sheets succeeded, check notification status
+          if (!candidateRecord.notificationSent) {
+            currentJob.attemptCount += 1;
+            currentJob.status = 'NOTIFICATION_PENDING';
+            currentJob.candidateId = candidateId;
+            currentJob.lastError =
+              candidateRecord.notificationError ||
+              'HR email notification failed';
+
+            const delayMs = calculateBackoffWithJitter(
+              currentJob.attemptCount,
+              this.config.initialRetryDelayMs || 2000,
+              this.config.maxRetryDelayMs || 60000,
+            );
+            currentJob.nextRetryAt = Date.now() + delayMs;
+            await this.queueService.updateJob(currentJob);
+
+            this.logger.warn(
+              `Job ${currentJob.id} persisted to Google Sheets but HR notification failed; marked NOTIFICATION_PENDING`,
+              { jobId: currentJob.id, candidateId },
+            );
+            return currentJob;
+          }
+
+          // Strict requirement: Never mark a candidate's Drive/Sheets processing complete if Drive upload failed
+          if (
+            candidateRecord?.driveError &&
+            candidateRecord?.driveSaved === false
+          ) {
+            currentJob.attemptCount += 1;
+            currentJob.status = 'FAILED_RETRYABLE';
+            currentJob.candidateId = candidateId;
+            currentJob.lastError =
+              candidateRecord?.driveError ||
+              'Google Drive CV upload failed. Ensure folders are shared with Service Account.';
+
+            const delayMs = calculateBackoffWithJitter(
+              currentJob.attemptCount,
+              this.config.initialRetryDelayMs || 2000,
+              this.config.maxRetryDelayMs || 60000,
+            );
+            currentJob.nextRetryAt = Date.now() + delayMs;
+            await this.queueService.updateJob(currentJob);
+
+            this.logger.warn(
+              `Job ${currentJob.id} could not upload CV to Google Drive; marked FAILED_RETRYABLE for retry`,
+              { jobId: currentJob.id, cause: currentJob.lastError },
+            );
+            return currentJob;
+          }
         }
 
         // Mark resume fingerprint as COMPLETED

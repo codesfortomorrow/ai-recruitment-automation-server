@@ -1,5 +1,4 @@
 import axios from 'axios';
-import { PDFParse } from 'pdf-parse';
 import mammoth from 'mammoth';
 import { forwardRef, Inject, Injectable, Optional } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
@@ -23,6 +22,8 @@ import { MailService } from './mail.service';
 import { ResumeScreeningQueueService } from './resume-screening-queue.service';
 import { ResumeScreeningWorkerService } from './resume-screening-worker.service';
 import { RoleDetectionService } from './role-detection.service';
+import { RecruitmentEmailClassifierService } from './recruitment-email-classifier.service';
+import { GoogleDriveService } from '../candidate/google-drive.service';
 
 @Injectable()
 export class GmailService extends BaseService {
@@ -30,6 +31,7 @@ export class GmailService extends BaseService {
   private tokenExpiresAt = 0;
   private isPolling = false;
   private readonly roleDetectionService: RoleDetectionService;
+  private readonly classifierService: RecruitmentEmailClassifierService;
 
   private static readonly PROCESSED_SET_KEY = 'gmail:processed_messages';
   private static readonly GMAIL_API_BASE =
@@ -53,10 +55,25 @@ export class GmailService extends BaseService {
     private readonly workerService?: ResumeScreeningWorkerService,
     @Optional()
     roleDetectionService?: RoleDetectionService,
+    @Optional()
+    classifierService?: RecruitmentEmailClassifierService,
+    @Optional()
+    @Inject(forwardRef(() => GoogleDriveService))
+    private readonly googleDriveService?: GoogleDriveService,
   ) {
     super({ loggerDefaultMeta: { service: GmailService.name } });
     this.roleDetectionService =
       roleDetectionService || new RoleDetectionService();
+    this.classifierService =
+      classifierService ||
+      new RecruitmentEmailClassifierService(
+        this.redisService,
+        this.roleDetectionService,
+      );
+  }
+
+  public getClassifierService(): RecruitmentEmailClassifierService {
+    return this.classifierService;
   }
 
   /**
@@ -226,6 +243,22 @@ export class GmailService extends BaseService {
   }
 
   /**
+   * Constructs an initial search query for Gmail message retrieval.
+   * Uses configured search query or sensible default, but does not rely on query alone as the filter.
+   */
+  public buildSearchQuery(options?: {
+    baseQuery?: string;
+    requireAttachments?: boolean;
+  }): string {
+    const base =
+      options?.baseQuery ?? this.config.searchQuery ?? 'label:INBOX is:unread';
+    if (options?.requireAttachments && !base.includes('has:attachment')) {
+      return `${base} has:attachment`;
+    }
+    return base;
+  }
+
+  /**
    * Lists message IDs matching query from Gmail.
    */
   async listMessages(options?: {
@@ -234,7 +267,9 @@ export class GmailService extends BaseService {
     pageToken?: string;
   }): Promise<GmailListResponse> {
     const accessToken = await this.getAccessToken();
-    const query = options?.query ?? this.config.searchQuery;
+    const query = this.buildSearchQuery(
+      options?.query ? { baseQuery: options.query } : undefined,
+    );
     const maxResults = options?.maxResults ?? 10;
 
     try {
@@ -390,19 +425,14 @@ export class GmailService extends BaseService {
   }
 
   /**
-   * Determines if a file is a potential resume based on extension or MIME type.
+   * Determines if a file is a potential resume based on extension or MIME type and filename.
    */
   private isResumeCandidate(filename: string, mimeType: string): boolean {
-    const lowerName = (filename || '').toLowerCase();
-    const lowerMime = (mimeType || '').toLowerCase();
-
-    return (
-      lowerName.endsWith('.pdf') ||
-      lowerName.endsWith('.docx') ||
-      lowerMime === 'application/pdf' ||
-      lowerMime ===
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    );
+    return this.classifierService.isPotentialResumeAttachment({
+      filename,
+      mimeType,
+      size: 0,
+    });
   }
 
   /**
@@ -442,17 +472,20 @@ export class GmailService extends BaseService {
     }
 
     if (isPdf) {
-      const parser = new PDFParse({ data: buffer });
       let text: string | undefined;
       let parseError: string | undefined;
 
       try {
-        const parsed = await parser.getText();
-        text = parsed.text?.trim();
+        const { PDFParse } = await import('pdf-parse');
+        const parser = new PDFParse({ data: buffer });
+        try {
+          const parsed = await parser.getText();
+          text = parsed.text?.trim();
+        } finally {
+          await parser.destroy().catch(() => {});
+        }
       } catch (err: any) {
         parseError = err.message;
-      } finally {
-        await parser.destroy().catch(() => {});
       }
 
       const isInsufficient = !text || this.isSuspiciouslyShortText(text);
@@ -550,6 +583,14 @@ export class GmailService extends BaseService {
   async extractAttachmentResume(
     messageId: string,
     attachment: GmailAttachmentMeta,
+    senderEmail?: string,
+    context?: {
+      subject?: string;
+      emailBody?: string;
+      senderName?: string;
+      senderEmail?: string;
+      jobRole?: string;
+    },
   ): Promise<ResumeExtractionResult> {
     const { filename, mimeType, size, attachmentId } = attachment;
 
@@ -594,7 +635,10 @@ export class GmailService extends BaseService {
 
       // Check if resume content was already processed: skip PDF/DOCX parsing entirely
       const isAlreadyProcessed =
-        await this.resumeFingerprintService.isFingerprintProcessed(fingerprint);
+        await this.resumeFingerprintService.isFingerprintProcessed(
+          fingerprint,
+          senderEmail,
+        );
       if (isAlreadyProcessed) {
         this.logger.info(
           `Duplicate resume skipped; fingerprint already processed`,
@@ -603,6 +647,7 @@ export class GmailService extends BaseService {
             attachmentId,
             filename,
             fingerprint,
+            senderEmail,
           },
         );
         return {
@@ -617,11 +662,22 @@ export class GmailService extends BaseService {
         };
       }
 
+      let extractedText: string | undefined;
+
       // Check if resume text is already durably retained in screening queue
       if (this.queueService) {
         const existingJob = await this.queueService.getJob(fingerprint);
         if (existingJob) {
-          if (existingJob.status === 'COMPLETED') {
+          const existingEmail = existingJob.sender?.email?.trim().toLowerCase();
+          const currentEmail = senderEmail?.trim().toLowerCase();
+          const isSameApplicant =
+            !currentEmail || !existingEmail || existingEmail === currentEmail;
+
+          if (
+            existingJob.status === 'COMPLETED' &&
+            isSameApplicant &&
+            existingJob.driveFileId
+          ) {
             return {
               attachmentId,
               filename,
@@ -631,15 +687,18 @@ export class GmailService extends BaseService {
               isDuplicate: true,
               fingerprint,
               error: 'Duplicate resume skipped; fingerprint already completed',
+              driveFileId: existingJob.driveFileId,
+              cvLink: existingJob.cvLink,
             };
           }
 
           if (
             existingJob.extractedResumeText &&
-            existingJob.extractedResumeText.trim().length > 0
+            existingJob.extractedResumeText.trim().length > 0 &&
+            existingJob.driveFileId
           ) {
             this.logger.info(
-              'Using durable extracted resume text from screening queue; skipping duplicate PDF/DOCX parsing',
+              'Using durable extracted resume text and Drive metadata from screening queue; skipping duplicate processing',
               { messageId, attachmentId, fingerprint },
             );
             return {
@@ -650,7 +709,16 @@ export class GmailService extends BaseService {
               status: 'success',
               text: existingJob.extractedResumeText,
               fingerprint,
+              driveFileId: existingJob.driveFileId,
+              cvLink: existingJob.cvLink,
             };
+          }
+
+          if (
+            existingJob.extractedResumeText &&
+            existingJob.extractedResumeText.trim().length > 0
+          ) {
+            extractedText = existingJob.extractedResumeText;
           }
         }
       }
@@ -680,31 +748,81 @@ export class GmailService extends BaseService {
         };
       }
 
-      const extraction = await this.extractResumeText(buffer);
+      if (!extractedText) {
+        const extraction = await this.extractResumeText(buffer);
 
-      if (extraction.error) {
-        await this.resumeFingerprintService.releaseProcessingLock(
-          fingerprint,
-          lock.lockToken,
-        );
-        return {
-          attachmentId,
-          filename,
-          mimeType,
-          size: buffer.length,
-          status: 'failed',
-          fingerprint,
-          error: extraction.error,
-        };
+        if (extraction.error) {
+          await this.resumeFingerprintService.releaseProcessingLock(
+            fingerprint,
+            lock.lockToken,
+          );
+          return {
+            attachmentId,
+            filename,
+            mimeType,
+            size: buffer.length,
+            status: 'failed',
+            fingerprint,
+            error: extraction.error,
+          };
+        }
+        extractedText = extraction.text;
       }
 
       this.logger.info('Extracted resume text successfully', {
         messageId,
         attachmentId,
         filename,
-        charactersExtracted: extraction.text!.length,
+        charactersExtracted: extractedText?.length || 0,
         fingerprint,
       });
+
+      let driveFileId: string | undefined;
+      let cvLink: string | undefined;
+
+      if (this.googleDriveService?.isConfigured()) {
+        try {
+          // Detect applied role before uploading to Drive so it routes to the correct folder
+          let resolvedRole: string | undefined = context?.jobRole;
+          if (!resolvedRole && this.roleDetectionService) {
+            const detected = this.roleDetectionService.detectRole({
+              subject: context?.subject,
+              body: (context?.emailBody || '') + ' ' + (extractedText || ''),
+              senderName: context?.senderName,
+              senderEmail: senderEmail || context?.senderEmail,
+            });
+            if (detected.status === 'RESOLVED') {
+              resolvedRole = detected.detectedRole;
+            }
+          }
+
+          const driveResult = await this.googleDriveService.uploadCv({
+            buffer,
+            filename,
+            mimeType,
+            role: resolvedRole,
+            candidateEmail: senderEmail || context?.senderEmail,
+            candidateName: context?.senderName,
+          });
+          driveFileId = driveResult.fileId;
+          cvLink = driveResult.cvLink;
+          await this.googleDriveService.markFileProcessed(driveResult.fileId);
+          this.logger.info(
+            `Uploaded candidate CV from Gmail to Google Drive folder "${driveResult.folderKey || 'ROOT'}" (File ID: ${driveResult.fileId})`,
+            {
+              messageId,
+              attachmentId,
+              fileId: driveResult.fileId,
+              role: resolvedRole,
+            },
+          );
+        } catch (driveErr: any) {
+          this.logger.warn(
+            `Failed to upload Gmail resume attachment to Google Drive: ${driveErr.message}`,
+            { messageId, attachmentId, filename },
+          );
+        }
+      }
 
       return {
         attachmentId,
@@ -712,9 +830,11 @@ export class GmailService extends BaseService {
         mimeType,
         size: buffer.length,
         status: 'success',
-        text: extraction.text,
+        text: extractedText,
         fingerprint,
         lockToken: lock.lockToken,
+        driveFileId,
+        cvLink,
       };
     } catch (err: any) {
       return {
@@ -735,6 +855,14 @@ export class GmailService extends BaseService {
   async processMessageResumes(
     messageId: string,
     attachments: GmailAttachmentMeta[],
+    senderEmail?: string,
+    context?: {
+      subject?: string;
+      emailBody?: string;
+      senderName?: string;
+      senderEmail?: string;
+      jobRole?: string;
+    },
   ): Promise<{
     resumes: ResumeExtractionResult[];
     hasDownloadFailure: boolean;
@@ -743,7 +871,12 @@ export class GmailService extends BaseService {
     let hasDownloadFailure = false;
 
     for (const att of attachments) {
-      const result = await this.extractAttachmentResume(messageId, att);
+      const result = await this.extractAttachmentResume(
+        messageId,
+        att,
+        senderEmail,
+        context,
+      );
       resumes.push(result);
 
       // Distinguish transient download/network failures from permanent document errors
@@ -859,6 +992,8 @@ export class GmailService extends BaseService {
 
         result.fingerprint = resume.fingerprint;
         result.lockToken = resume.lockToken;
+        (result as any).driveFileId = resume.driveFileId;
+        (result as any).cvLink = resume.cvLink;
 
         analyses.push(result);
         if (result.status === 'failed') {
@@ -891,6 +1026,7 @@ export class GmailService extends BaseService {
     query?: string;
     maxResults?: number;
     analyzeWithGemini?: boolean;
+    asyncScreening?: boolean;
   }): Promise<GmailMessageDetail[]> {
     const listResult = await this.listMessages(options);
 
@@ -911,28 +1047,66 @@ export class GmailService extends BaseService {
       try {
         const messageDetail = await this.getMessage(item.id);
 
-        // Pre-filter: Check if message contains any potential resume attachments (PDF or DOCX)
-        const hasResumeAttachment = (messageDetail.attachments || []).some(
-          (att) => this.isResumeCandidate(att.filename, att.mimeType),
+        // Dedicated recruitment-email classification step BEFORE downloading attachments or creating screening jobs
+        const classification =
+          this.classifierService.classifyEmail(messageDetail);
+
+        this.logger.info(
+          `Classification decision for email "${this.classifierService.sanitizeSnippet(messageDetail.subject)}" (ID: ${messageDetail.id}): ${classification.decision} (${classification.auditReason})`,
+          {
+            messageId: item.id,
+            decision: classification.decision,
+            auditReason: classification.auditReason,
+            confidence: classification.confidence,
+            matchedIndicators: classification.matchedIndicators,
+            detectedRole: classification.detectedRole,
+          },
         );
 
-        if (!hasResumeAttachment) {
-          this.logger.info(
-            `Skipping non-recruitment email "${messageDetail.subject}" (ID: ${messageDetail.id}): No resume attachments (PDF/DOCX) detected`,
+        if (classification.decision === 'UNRELATED_EMAIL') {
+          // Skip unrelated emails (newsletters, holiday notices, devops alerts, invoices, etc.)
+          // without downloading attachments, invoking Gemini, creating candidates, or sending notifications.
+          await this.markMessageProcessed(item.id);
+          continue;
+        }
+
+        if (classification.decision === 'UNSUPPORTED_ATTACHMENT') {
+          // Candidate application language was found, but without a supported resume attachment (PDF or DOCX).
+          this.logger.warn(
+            `Skipping application with unsupported attachment (ID: ${messageDetail.id}): ${classification.rejectionReason}`,
             {
               messageId: item.id,
-              sender: messageDetail.sender?.email,
+              auditReason: classification.auditReason,
             },
           );
-          // Mark as processed in Redis to avoid re-evaluating ordinary notifications on every poll
           await this.markMessageProcessed(item.id);
-          // Do not push non-recruitment email to newMessages counter
+          continue;
+        }
+
+        if (classification.decision === 'AMBIGUOUS') {
+          // Place ambiguous email into review state rather than creating candidate or silently processing
+          await this.classifierService.recordAmbiguousReview(
+            messageDetail,
+            classification,
+          );
+          await this.markMessageProcessed(item.id);
           continue;
         }
 
         // 1. Process attachments independently
         const { resumes, hasDownloadFailure } =
-          await this.processMessageResumes(item.id, messageDetail.attachments);
+          await this.processMessageResumes(
+            item.id,
+            messageDetail.attachments,
+            messageDetail.sender?.email,
+            {
+              subject: messageDetail.subject,
+              emailBody: messageDetail.textBody || messageDetail.snippet,
+              senderName: messageDetail.sender?.name,
+              senderEmail: messageDetail.sender?.email,
+              jobRole: classification.detectedRole,
+            },
+          );
         messageDetail.resumes = resumes;
 
         const validResumes = resumes.filter(
@@ -977,22 +1151,35 @@ export class GmailService extends BaseService {
                 roleResolution.status === 'RESOLVED'
                   ? roleResolution.detectedRole
                   : undefined,
+              driveFileId: resume.driveFileId,
+              cvLink: resume.cvLink,
+              source: 'GMAIL',
             });
 
             if (shouldAnalyzeWithGemini) {
-              const processedJob =
-                await this.workerService.processSingleJob(job);
-              if (processedJob.status === 'RETRY_WAIT') {
+              if (options?.asyncScreening) {
                 this.logger.info(
-                  `Resume screening job ${job.id} enqueued in durable retry state (RETRY_WAIT); Gmail message marked processed`,
+                  `Resume screening job ${job.id} enqueued for decoupled background worker processing`,
                   {
                     messageId: item.id,
                     jobId: job.id,
-                    nextRetryAt: new Date(
-                      processedJob.nextRetryAt,
-                    ).toISOString(),
                   },
                 );
+              } else {
+                const processedJob =
+                  await this.workerService.processSingleJob(job);
+                if (processedJob.status === 'RETRY_WAIT') {
+                  this.logger.info(
+                    `Resume screening job ${job.id} enqueued in durable retry state (RETRY_WAIT); Gmail message marked processed`,
+                    {
+                      messageId: item.id,
+                      jobId: job.id,
+                      nextRetryAt: new Date(
+                        processedJob.nextRetryAt,
+                      ).toISOString(),
+                    },
+                  );
+                }
               }
             }
           }
@@ -1020,6 +1207,8 @@ export class GmailService extends BaseService {
                       {
                         messageDetail,
                         analysisResult: analysis,
+                        driveFileId: (analysis as any).driveFileId,
+                        cvLink: (analysis as any).cvLink,
                       },
                     );
                   } catch (persistErr: any) {
@@ -1098,12 +1287,13 @@ export class GmailService extends BaseService {
 
     this.isPolling = true;
     this.logger.info(
-      'Recruitment automation check started: checking Gmail inbox for new internship applications...',
+      'Recruitment automation check started: checking Gmail inbox for candidate applications...',
     );
 
     try {
       const applications = await this.fetchNewApplications({
         query: this.config.searchQuery,
+        asyncScreening: true,
       });
 
       this.logger.info('Recruitment automation check completed', {

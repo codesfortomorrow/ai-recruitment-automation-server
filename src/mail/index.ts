@@ -10,3 +10,5 @@ export * from './gemini-error.classifier';
 export * from './resume-fingerprint.service';
 export * from './resume-screening-queue.service';
 export * from './resume-screening-worker.service';
+export * from './role-detection.service';
+export * from './recruitment-email-classifier.service';

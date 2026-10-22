@@ -360,4 +360,17 @@ export class MailController extends BaseController {
       job,
     };
   }
+
+  @ApiOperation({
+    summary: 'List ambiguous candidate emails held in review state',
+  })
+  @Get('review/ambiguous')
+  async listAmbiguousEmails() {
+    const classifier = this.gmailService.getClassifierService();
+    const reviews = await classifier.getAmbiguousReviews();
+    return {
+      total: reviews.length,
+      ambiguousEmails: reviews,
+    };
+  }
 }

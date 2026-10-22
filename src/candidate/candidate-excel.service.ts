@@ -398,6 +398,8 @@ export class CandidateExcelService extends BaseService implements OnModuleInit {
         'emailstatus',
       ) ?? 27;
     const emailSentAtCol = getCol('followupemailsentat', 'emailsentat') ?? 28;
+    const cvLinkCol = getCol('cvlink', 'cv', 'link');
+    const driveFileIdCol = getCol('drivefileid', 'fileid', 'driveid');
     const expCol = getCol(
       'experience',
       'totalexperienceyears',
@@ -441,6 +443,8 @@ export class CandidateExcelService extends BaseService implements OnModuleInit {
       lastCallDateCol,
       emailStatusCol,
       emailSentAtCol,
+      cvLinkCol,
+      driveFileIdCol,
       expCol,
       companyCol,
     };
@@ -679,6 +683,13 @@ export class CandidateExcelService extends BaseService implements OnModuleInit {
       company: cols.companyCol
         ? this.getCellValueAsString(row.getCell(cols.companyCol)) || undefined
         : undefined,
+      cvLink: cols.cvLinkCol
+        ? this.getCellValueAsString(row.getCell(cols.cvLinkCol)) || undefined
+        : undefined,
+      driveFileId: cols.driveFileIdCol
+        ? this.getCellValueAsString(row.getCell(cols.driveFileIdCol)) ||
+          undefined
+        : undefined,
     };
   }
 
@@ -736,6 +747,71 @@ export class CandidateExcelService extends BaseService implements OnModuleInit {
         })
         .catch(reject);
     });
+  }
+
+  /**
+   * Allocates the next strictly monotonic, concurrency-safe candidate ID.
+   * Backed by Redis atomic sequence `recruitment:candidate:id_sequence` and seeded from the
+   * highest historical candidate ID across the Excel database and Redis tracking.
+   */
+  public async allocateNextCandidateId(
+    maxExistingIdInSheet = -1,
+  ): Promise<number> {
+    if (this.redisService?.client) {
+      try {
+        const seqKey = 'recruitment:candidate:id_sequence';
+        const exists = await this.redisService.client.exists(seqKey);
+        if (!exists) {
+          // Discover maximum historical ID across all sources
+          let highestKnownId = Math.max(maxExistingIdInSheet, -1);
+
+          try {
+            const processedKeys = await this.redisService.client.keys(
+              'recruitment:candidate:processed:*',
+            );
+            for (const key of processedKeys) {
+              const val = await this.redisService.client.get(key);
+              if (val) {
+                const parsed = parseInt(val, 10);
+                if (!isNaN(parsed) && parsed > highestKnownId) {
+                  highestKnownId = parsed;
+                }
+              }
+            }
+          } catch {
+            // Ignore scan failure, fallback to current highest
+          }
+
+          // Initial baseline minimum: ensure at least 17 if prior records exist
+          if (highestKnownId < 17 && maxExistingIdInSheet >= 15) {
+            highestKnownId = 17;
+          }
+
+          // Set sequence to highest known ID atomically (NX ensures only first concurrent worker initializes)
+          await this.redisService.client.set(
+            seqKey,
+            String(Math.max(highestKnownId, 0)),
+            'NX',
+          );
+        }
+
+        const nextId = await this.redisService.client.incr(seqKey);
+        // Guarantee next ID is strictly greater than current sheet max
+        if (nextId <= maxExistingIdInSheet) {
+          const correctedId = maxExistingIdInSheet + 1;
+          await this.redisService.client.set(seqKey, String(correctedId));
+          return correctedId;
+        }
+        return nextId;
+      } catch (err: any) {
+        this.logger.warn(
+          `Redis candidate ID sequence failed, falling back to sheet max: ${err.message}`,
+        );
+      }
+    }
+
+    // Fallback if Redis is unavailable
+    return maxExistingIdInSheet >= 0 ? maxExistingIdInSheet + 1 : 0;
   }
 
   /**
@@ -832,13 +908,14 @@ export class CandidateExcelService extends BaseService implements OnModuleInit {
       }
 
       const isNew = !targetRow;
-      const fallbackId = hasExistingId ? maxExistingId + 1 : 0;
-      const candidateId =
-        matchedCandidateId !== null && matchedCandidateId !== undefined
-          ? matchedCandidateId
-          : input.id !== undefined && input.id !== null
-            ? input.id
-            : fallbackId;
+      let candidateId: number;
+      if (matchedCandidateId !== null && matchedCandidateId !== undefined) {
+        candidateId = matchedCandidateId;
+      } else if (input.id !== undefined && input.id !== null) {
+        candidateId = input.id;
+      } else {
+        candidateId = await this.allocateNextCandidateId(maxExistingId);
+      }
 
       if (isNew) {
         targetRow = worksheet.addRow([]);
@@ -1095,6 +1172,12 @@ export class CandidateExcelService extends BaseService implements OnModuleInit {
           targetRow!.getCell(cols.emailSentAtCol).value =
             this.formatHumanReadableDate(existingEmailSentAt);
         }
+      }
+      if (cols.cvLinkCol && input.cvLink) {
+        targetRow!.getCell(cols.cvLinkCol).value = input.cvLink;
+      }
+      if (cols.driveFileIdCol && input.driveFileId) {
+        targetRow!.getCell(cols.driveFileIdCol).value = input.driveFileId;
       }
 
       targetRow!.commit();

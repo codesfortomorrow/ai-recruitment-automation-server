@@ -30,6 +30,8 @@ export interface ResumeExtractionResult {
   fingerprint?: string;
   isDuplicate?: boolean;
   lockToken?: string;
+  driveFileId?: string;
+  cvLink?: string;
 }
 
 export interface GmailMessageDetail {

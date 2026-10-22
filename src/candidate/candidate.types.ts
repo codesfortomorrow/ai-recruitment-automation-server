@@ -13,6 +13,7 @@ export type CanonicalRole =
   | 'TYPESCRIPT_DEVELOPER'
   | 'JAVA_DEVELOPER'
   | 'PYTHON_DEVELOPER'
+  | 'DEVOPS_ENGINEER'
 
   // QA and testing
   | 'QA_TESTER'
@@ -92,9 +93,10 @@ export interface CandidateProfileResponse {
   attachmentId: string | null;
   filename: string | null;
   mimeType: string | null;
-  attachmentSize: number | null;
   analyzedAt: Date;
   createdAt: Date;
+  cvLink?: string | null;
+  driveFileId?: string | null;
 }
 
 export interface ExcelRowError {
@@ -182,6 +184,8 @@ export interface SaveCandidateInput {
   lastCallDate?: string | null;
   automatedFollowUpEmailStatus?: string | null;
   followUpEmailSentAt?: string | null;
+  cvLink?: string | null;
+  driveFileId?: string | null;
 }
 
 export interface ExcelCandidateRecord {
@@ -192,6 +196,7 @@ export interface ExcelCandidateRecord {
   jobRole: string;
   normalizedRole?: string;
   assignedHrName: string;
+  assignedHrId?: string;
   assignedHrEmail?: string;
   screeningStatus: 'SHORTLIST' | 'REJECT' | 'MANUAL_REVIEW' | string;
   applicationStatus?: string;
@@ -233,4 +238,10 @@ export interface ExcelCandidateRecord {
   matchedRequirements?: string[];
   missingRequirements?: string[];
   screeningExplanation?: string;
+  cvLink?: string;
+  driveFileId?: string;
+  lastUpdatedBy?: string;
+  lastUpdatedAt?: string;
+  callbackStatus?: string;
+  callStatus?: string;
 }

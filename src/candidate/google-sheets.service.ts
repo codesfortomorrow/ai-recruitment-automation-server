@@ -42,6 +42,8 @@ export interface GoogleSheetCandidateInput {
   lastCallDate?: string | null;
   automatedFollowUpEmailStatus?: string | null;
   followUpEmailSentAt?: string | null;
+  cvLink?: string | null;
+  driveFileId?: string | null;
 }
 
 export interface GoogleSheetSaveResult {
@@ -79,6 +81,8 @@ export interface GoogleSheetTrackerRow {
   hrRemarks: string;
   lastUpdatedBy: string;
   lastUpdatedAt: string;
+  cvLink?: string;
+  driveFileId?: string;
 }
 
 @Injectable()
@@ -115,6 +119,8 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
     'HR Remarks',
     'Last Updated By',
     'Last Updated At',
+    'CV Link',
+    'Drive File ID',
   ];
 
   public static readonly APPLICATION_STATUS_OPTIONS = [
@@ -181,20 +187,75 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
           `Failed to ensure Google Sheets Candidate Tracker on startup: ${this.sanitizeError(err)}`,
         );
       }
+    } else if (this.isRequired()) {
+      const issue = this.getConfigurationIssue();
+      this.logger.warn(
+        `Google Sheets candidate synchronization is required but misconfigured: ${issue}. Newly processed candidates will be queued for retry until resolved.`,
+        {
+          spreadsheetId: this.config.spreadsheetId,
+          tabName: this.config.tabName,
+        },
+      );
     }
+  }
+
+  /**
+   * Returns whether Google Sheets configuration is required by environment settings.
+   */
+  public isRequired(): boolean {
+    return Boolean(
+      this.config.spreadsheetId && this.config.spreadsheetId.trim().length > 0,
+    );
+  }
+
+  /**
+   * Returns the exact configuration issue if Google Sheets is missing or misconfigured,
+   * without exposing private credentials, tokens, or secrets.
+   */
+  public getConfigurationIssue(): string {
+    if (!this.config.spreadsheetId || !this.config.spreadsheetId.trim()) {
+      return 'GOOGLE_SHEETS_SPREADSHEET_ID is missing or empty in environment';
+    }
+    if (!this.config.keyFile || !this.config.keyFile.trim()) {
+      return 'GOOGLE_SHEETS_KEY_FILE is missing or empty in environment';
+    }
+    const resolvedKeyPath = path.isAbsolute(this.config.keyFile)
+      ? this.config.keyFile
+      : path.resolve(process.cwd(), this.config.keyFile);
+    if (!fs.existsSync(resolvedKeyPath)) {
+      return `Google Service Account key file not found at path "${resolvedKeyPath}". Please ensure the service account JSON key file exists at this path or configure GOOGLE_SHEETS_KEY_FILE`;
+    }
+    try {
+      const stats = fs.statSync(resolvedKeyPath);
+      if (!stats.isFile()) {
+        return `Path "${resolvedKeyPath}" is a directory, not a valid service account JSON file`;
+      }
+      fs.accessSync(resolvedKeyPath, fs.constants.R_OK);
+      const raw = fs.readFileSync(resolvedKeyPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (
+        parsed.type !== 'service_account' ||
+        !parsed.project_id ||
+        !parsed.private_key ||
+        !parsed.client_email
+      ) {
+        return `Service account JSON file at "${resolvedKeyPath}" is missing required fields (type, project_id, private_key, or client_email)`;
+      }
+    } catch (parseErr: any) {
+      return `Failed to read or parse service account JSON file at "${resolvedKeyPath}": ${parseErr.message}`;
+    }
+    return '';
+  }
+
+  public getSpreadsheetId(): string {
+    return this.config.spreadsheetId || '';
   }
 
   /**
    * Returns whether Google Sheets configuration is present and valid.
    */
   public isConfigured(): boolean {
-    if (!this.config.spreadsheetId || !this.config.keyFile) {
-      return false;
-    }
-    const resolvedKeyPath = path.isAbsolute(this.config.keyFile)
-      ? this.config.keyFile
-      : path.resolve(process.cwd(), this.config.keyFile);
-    return fs.existsSync(resolvedKeyPath);
+    return this.getConfigurationIssue() === '';
   }
 
   public getPollingConfig(): {
@@ -349,7 +410,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
 
       const readRes = await client.spreadsheets.values.get({
         spreadsheetId,
-        range: `'${tabName}'!A:Z`,
+        range: `'${tabName}'!A:AB`,
       });
 
       const rows: any[][] = readRes.data.values || [];
@@ -393,11 +454,49 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
           hrRemarks: String(row[23] || '').trim(),
           lastUpdatedBy: String(row[24] || '').trim(),
           lastUpdatedAt: String(row[25] || '').trim(),
+          cvLink: String(row[26] || '').trim(),
+          driveFileId: String(row[27] || '').trim(),
         });
       }
 
       return trackerRows;
     });
+  }
+
+  /**
+   * Retrieves single candidate row by Candidate ID from Google Sheets tracker tab.
+   */
+  public async findCandidateById(
+    candidateId: number,
+  ): Promise<GoogleSheetTrackerRow | null> {
+    if (
+      !this.isConfigured() ||
+      candidateId === undefined ||
+      candidateId === null ||
+      isNaN(candidateId)
+    ) {
+      return null;
+    }
+    const rows = await this.readCandidateTrackerRows();
+    return rows.find((r) => r.candidateId === candidateId) || null;
+  }
+
+  /**
+   * Retrieves single candidate row by normalized email from Google Sheets tracker tab.
+   */
+  public async findCandidateByEmail(
+    email: string,
+  ): Promise<GoogleSheetTrackerRow | null> {
+    if (!this.isConfigured() || !email) {
+      return null;
+    }
+    const normalized = email.trim().toLowerCase();
+    const rows = await this.readCandidateTrackerRows();
+    return (
+      rows.find(
+        (r) => r.email && r.email.trim().toLowerCase() === normalized,
+      ) || null
+    );
   }
 
   /**
@@ -420,7 +519,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
 
       const readRes = await client.spreadsheets.values.get({
         spreadsheetId,
-        range: `'${tabName}'!A:Z`,
+        range: `'${tabName}'!A:AB`,
       });
 
       const rows: any[][] = readRes.data.values || [];
@@ -599,7 +698,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
           addSheetRes.data.replies?.[0]?.addSheet?.properties?.sheetId || 0;
         await client.spreadsheets.values.update({
           spreadsheetId,
-          range: `'${tabName}'!A1:Z1`,
+          range: `'${tabName}'!A1:AB1`,
           valueInputOption: 'RAW',
           requestBody: {
             values: [GoogleSheetsService.EXPECTED_HEADERS],
@@ -612,7 +711,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         );
 
         this.logger.info(
-          `Created Google Sheets worksheet "${tabName}" with canonical 26-column A:Z schema`,
+          `Created Google Sheets worksheet "${tabName}" with canonical 28-column A:AB schema`,
           {
             worksheet: tabName,
             detectedOldSchema: [],
@@ -637,7 +736,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
       const colCount =
         targetSheet.properties?.gridProperties?.columnCount ?? 26;
 
-      // Ensure gridProperties has at least 26 columns (A:Z)
+      // Ensure gridProperties has at least 28 columns (A:AB)
       if (colCount < GoogleSheetsService.EXPECTED_HEADERS.length) {
         await client.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -662,7 +761,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
       // Read current rows
       const readRes = await client.spreadsheets.values.get({
         spreadsheetId,
-        range: `'${actualTabName}'!A:Z`,
+        range: `'${actualTabName}'!A:AB`,
       });
       const rows: any[][] = readRes.data.values || [];
 
@@ -691,7 +790,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
           try {
             await client.spreadsheets.values.clear({
               spreadsheetId,
-              range: `'${actualTabName}'!A${lastCandidateRow + 1}:Z${Math.max(rowCount, rows.length)}`,
+              range: `'${actualTabName}'!A${lastCandidateRow + 1}:AB${Math.max(rowCount, rows.length)}`,
             });
           } catch (clearErr: any) {
             this.logger.warn(
@@ -709,7 +808,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         );
 
         this.logger.info(
-          `Google Sheets Candidate Tracker schema is already up to date with 26-column A:Z schema`,
+          `Google Sheets Candidate Tracker schema is already up to date with 28-column A:AB schema`,
           {
             worksheet: actualTabName,
             detectedOldSchema: existingHeaders,
@@ -789,7 +888,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
       // 2. Fetch current rows to check for existing candidate / header
       const readRes = await client.spreadsheets.values.get({
         spreadsheetId,
-        range: `'${actualTabName}'!A:Z`,
+        range: `'${actualTabName}'!A:AB`,
       });
 
       let rows: any[][] = readRes.data.values || [];
@@ -803,12 +902,15 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         rows,
       );
 
-      // 4. Search for matching existing row by candidateId or normalized email
+      // 4. Search for matching existing row by candidateId, driveFileId, or normalized email
       let targetRowIndex = -1; // 0-based index in rows array
       let maxExistingId = -1;
       let hasExistingId = false;
       const normalizedInputEmail = input.email
         ? input.email.trim().toLowerCase()
+        : null;
+      const cleanDriveFileId = input.driveFileId
+        ? input.driveFileId.trim()
         : null;
 
       for (let r = 1; r < rows.length; r++) {
@@ -817,6 +919,8 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         const cellEmail = String(row[2] || '')
           .trim()
           .toLowerCase();
+        const cellCvLink = String(row[26] || '').trim();
+        const cellDriveFileId = String(row[27] || '').trim();
 
         if (!isNaN(cellId)) {
           hasExistingId = true;
@@ -831,6 +935,16 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
           input.id !== null &&
           !isNaN(cellId) &&
           cellId === input.id
+        ) {
+          targetRowIndex = r;
+          break;
+        }
+
+        // Match by Drive file ID if provided (stable identifier for crash recovery)
+        if (
+          cleanDriveFileId &&
+          (cellDriveFileId === cleanDriveFileId ||
+            cellCvLink.includes(cleanDriveFileId))
         ) {
           targetRowIndex = r;
           break;
@@ -1068,6 +1182,33 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
       const lastUpdatedBy = 'AI Recruitment System';
       const lastUpdatedAt = this.formatLastUpdatedAt();
 
+      const driveFileId =
+        input.driveFileId !== undefined && input.driveFileId !== null
+          ? input.driveFileId
+          : isUpdate
+            ? existingRow[27] || ''
+            : '';
+
+      let cvLink =
+        input.cvLink !== undefined && input.cvLink !== null
+          ? input.cvLink
+          : input.driveFileId
+            ? `=HYPERLINK("https://drive.google.com/file/d/${input.driveFileId}/view", "View CV")`
+            : driveFileId
+              ? `=HYPERLINK("https://drive.google.com/file/d/${driveFileId}/view", "View CV")`
+              : isUpdate
+                ? existingRow[26] || ''
+                : '';
+
+      if (
+        cvLink &&
+        typeof cvLink === 'string' &&
+        cvLink.startsWith('http') &&
+        !cvLink.startsWith('=')
+      ) {
+        cvLink = `=HYPERLINK("${cvLink}", "View CV")`;
+      }
+
       const rowValues = [
         candidateId, // 0 (A): Candidate ID
         candidateName, // 1 (B): Candidate Name
@@ -1095,15 +1236,22 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         hrRemarks, // 23 (X): HR Remarks (HR field)
         lastUpdatedBy, // 24 (Y): Last Updated By
         lastUpdatedAt, // 25 (Z): Last Updated At
+        cvLink, // 26 (AA): CV Link
+        driveFileId, // 27 (AB): Drive File ID
       ];
+
+      const hasFormula = rowValues.some(
+        (v) => typeof v === 'string' && v.startsWith('='),
+      );
+      const valueInputOption = hasFormula ? 'USER_ENTERED' : 'RAW';
 
       if (!isUpdate) {
         // APPEND new candidate record to Google Sheets using spreadsheets.values.append
         // with INSERT_ROWS to ensure a brand new row is created and existing rows are never overwritten.
         const appendRes = await client.spreadsheets.values.append({
           spreadsheetId,
-          range: `'${actualTabName}'!A:Z`,
-          valueInputOption: 'RAW',
+          range: `'${actualTabName}'!A:AB`,
+          valueInputOption,
           insertDataOption: 'INSERT_ROWS',
           requestBody: {
             values: [rowValues],
@@ -1156,7 +1304,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
                 rowNumber,
                 updatedRange:
                   updatedRange ||
-                  `'${actualTabName}'!A${rowNumber}:Z${rowNumber}`,
+                  `'${actualTabName}'!A${rowNumber}:AB${rowNumber}`,
                 action: 'appended',
                 updatedAt: lastUpdatedAt,
               }),
@@ -1188,17 +1336,17 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
           candidateId,
           rowNumber,
           updatedRange:
-            updatedRange || `'${actualTabName}'!A${rowNumber}:Z${rowNumber}`,
+            updatedRange || `'${actualTabName}'!A${rowNumber}:AB${rowNumber}`,
         };
       } else {
         // UPDATE existing candidate record at its exact existing row
         const rowNumber = targetRowIndex + 1;
-        const updateRange = `'${actualTabName}'!A${rowNumber}:Z${rowNumber}`;
+        const updateRange = `'${actualTabName}'!A${rowNumber}:AB${rowNumber}`;
 
         const updateRes = await client.spreadsheets.values.update({
           spreadsheetId,
           range: updateRange,
-          valueInputOption: 'RAW',
+          valueInputOption,
           requestBody: {
             values: [rowValues],
           },
@@ -1272,6 +1420,113 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
   }
 
   /**
+   * Safely updates ONLY Column AA (CV Link) and Column AB (Drive File ID) for an existing candidate.
+   * Completely preserves Columns A through Z (all HR-managed columns, call statuses, dates, remarks, etc.).
+   * Uses USER_ENTERED to ensure clickable hyperlink formula rendering.
+   */
+  public async updateCandidateDriveColumns(
+    rowNumber: number,
+    driveFileId: string,
+    cvLink?: string,
+  ): Promise<{ rowNumber: number; cvLink: string; driveFileId: string }> {
+    const client = this.getClient();
+    if (!client) {
+      throw new Error('Google Sheets client is not configured');
+    }
+
+    const spreadsheetId = this.config.spreadsheetId;
+    const tabName = this.config.tabName || 'Candidate Tracker';
+    let actualTabName = tabName;
+    try {
+      const spreadsheetMeta = await client.spreadsheets.get({
+        spreadsheetId,
+        fields: 'sheets(properties(sheetId,title))',
+      });
+      const targetSheet =
+        spreadsheetMeta.data.sheets?.find(
+          (s) => s.properties?.title?.toLowerCase() === tabName.toLowerCase(),
+        ) || spreadsheetMeta.data.sheets?.[0];
+      actualTabName = targetSheet?.properties?.title || tabName;
+    } catch (err: any) {
+      this.logger.warn(
+        `Could not resolve sheet title from metadata, falling back to ${tabName}: ${err.message}`,
+      );
+    }
+
+    const formattedCvLink =
+      cvLink && cvLink.startsWith('=')
+        ? cvLink
+        : cvLink && cvLink.startsWith('http')
+          ? `=HYPERLINK("${cvLink}", "View CV")`
+          : `=HYPERLINK("https://drive.google.com/file/d/${driveFileId}/view", "View CV")`;
+
+    const updateRange = `'${actualTabName}'!AA${rowNumber}:AB${rowNumber}`;
+
+    await client.spreadsheets.values.update({
+      spreadsheetId,
+      range: updateRange,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[formattedCvLink, driveFileId]],
+      },
+    });
+
+    this.logger.info(
+      `Updated Drive columns (AA:AB) for candidate at row ${rowNumber}`,
+      { rowNumber, driveFileId, tabName: actualTabName },
+    );
+
+    return { rowNumber, cvLink: formattedCvLink, driveFileId };
+  }
+
+  /**
+   * Looks up an existing candidate record in Google Sheets by Drive File ID.
+   */
+  public async findCandidateByDriveFileId(driveFileId: string): Promise<{
+    rowNumber: number;
+    candidateId?: string | number;
+    row: any[];
+  } | null> {
+    const client = this.getClient();
+    if (!client || !driveFileId) return null;
+
+    try {
+      const tabName = this.config.tabName || 'Candidate Tracker';
+      const spreadsheetId = this.config.spreadsheetId;
+
+      const res = await client.spreadsheets.values.get({
+        spreadsheetId,
+        range: `'${tabName}'!A:AB`,
+      });
+
+      const rows: any[][] = res.data.values || [];
+      if (rows.length <= 1) return null;
+
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        const rowDriveFileId = String(row[27] || '').trim();
+        const rowCvLink = String(row[26] || '');
+        if (
+          (rowDriveFileId && rowDriveFileId === driveFileId) ||
+          (rowCvLink && rowCvLink.includes(driveFileId))
+        ) {
+          return {
+            rowNumber: i + 1,
+            candidateId: row[0],
+            row,
+          };
+        }
+      }
+      return null;
+    } catch (err: any) {
+      this.logger.warn(
+        `Failed to find candidate by Drive File ID in Google Sheets: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
    * Safely inspects the Google Sheets headers and migrates them to the new schema
    * without data loss or column shifting.
    */
@@ -1285,7 +1540,7 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
     if (rows.length === 0) {
       await client.spreadsheets.values.update({
         spreadsheetId,
-        range: `'${actualTabName}'!A1:Z1`,
+        range: `'${actualTabName}'!A1:AB1`,
         valueInputOption: 'RAW',
         requestBody: {
           values: [GoogleSheetsService.EXPECTED_HEADERS],
@@ -1507,6 +1762,19 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         getCol(oldRow, 'last updated by') || 'AI Recruitment System';
       const lastUpdatedAt =
         getCol(oldRow, 'last updated at') || this.formatLastUpdatedAt();
+      const cvLink = getCol(
+        oldRow,
+        'cv link',
+        'resume link',
+        'cv url',
+        'resume url',
+      );
+      const driveFileId = getCol(
+        oldRow,
+        'drive file id',
+        'file id',
+        'drive id',
+      );
 
       migratedRows.push([
         candidateId,
@@ -1535,14 +1803,16 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
         hrRemarks,
         lastUpdatedBy,
         lastUpdatedAt,
+        cvLink,
+        driveFileId,
       ]);
     }
 
-    // Write migrated structure to sheet (A1:Z{migratedRows.length})
+    // Write migrated structure to sheet (A1:AB{migratedRows.length})
     await client.spreadsheets.values.update({
       spreadsheetId,
-      range: `'${actualTabName}'!A1:Z${migratedRows.length}`,
-      valueInputOption: 'RAW',
+      range: `'${actualTabName}'!A1:AB${migratedRows.length}`,
+      valueInputOption: 'USER_ENTERED',
       requestBody: {
         values: migratedRows,
       },
@@ -2607,7 +2877,67 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
   }
 
   /**
-   * Retries an async task with exponential backoff on transient errors.
+   * Determines whether a Google Sheets API error is transient and safe to retry.
+   * Permanent errors (400, 401, 403, 404, invalid credentials) fail fast.
+   */
+  public isTransientError(err: any): boolean {
+    if (!err) return false;
+    const status =
+      err.status ||
+      err.code ||
+      err.response?.status ||
+      err.response?.data?.error?.code;
+
+    // Definite permanent error codes
+    if (status === 400 || status === 401 || status === 403 || status === 404) {
+      return false;
+    }
+
+    // Definite transient status codes
+    if (
+      status === 429 ||
+      status === 500 ||
+      status === 502 ||
+      status === 503 ||
+      status === 504
+    ) {
+      return true;
+    }
+
+    const msg = String(err.message || '').toLowerCase();
+    // Permanent error messages
+    if (
+      msg.includes('invalid_grant') ||
+      msg.includes('permission denied') ||
+      msg.includes('unauthorized') ||
+      msg.includes('not found') ||
+      msg.includes('bad request')
+    ) {
+      return false;
+    }
+
+    // Transient keywords
+    if (
+      msg.includes('503') ||
+      msg.includes('429') ||
+      msg.includes('service unavailable') ||
+      msg.includes('backend error') ||
+      msg.includes('rate limit') ||
+      msg.includes('econnreset') ||
+      msg.includes('etimedout') ||
+      msg.includes('timeout') ||
+      msg.includes('network') ||
+      msg.includes('gaxios')
+    ) {
+      return true;
+    }
+
+    // Default to transient for unexpected network/service exceptions
+    return true;
+  }
+
+  /**
+   * Retries an async task with bounded exponential backoff and jitter on transient errors.
    */
   private async executeWithRetry<T>(
     fn: () => Promise<T>,
@@ -2622,13 +2952,19 @@ export class GoogleSheetsService extends BaseService implements OnModuleInit {
       } catch (err: any) {
         attempt++;
         lastError = err;
-        if (attempt >= maxRetries) {
+
+        // Permanent errors fail fast without wasteful retries
+        if (!this.isTransientError(err) || attempt >= maxRetries) {
           break;
         }
 
-        const backoffMs = Math.min(500 * Math.pow(2, attempt - 1), 3000);
+        const jitter = Math.floor(Math.random() * 200);
+        const backoffMs = Math.min(
+          500 * Math.pow(2, attempt - 1) + jitter,
+          3000,
+        );
         this.logger.warn(
-          `Google Sheets operation failed (attempt ${attempt}/${maxRetries}); retrying in ${backoffMs}ms...`,
+          `Google Sheets operation failed with transient error (attempt ${attempt}/${maxRetries}); retrying in ${backoffMs}ms...`,
           { cause: this.sanitizeError(err) },
         );
         await new Promise((resolve) => setTimeout(resolve, backoffMs));

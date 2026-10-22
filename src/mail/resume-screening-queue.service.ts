@@ -24,6 +24,9 @@ export interface CreateScreeningJobInput {
   emailBody?: string;
   extractedResumeText: string;
   jobRole?: string;
+  driveFileId?: string;
+  cvLink?: string;
+  source?: 'GMAIL' | 'DRIVE_MANUAL';
 }
 
 @Injectable()
@@ -147,20 +150,35 @@ export class ResumeScreeningQueueService
    * If a job already exists for this fingerprint, returns the existing job to prevent duplicates.
    */
   async enqueueJob(input: CreateScreeningJobInput): Promise<ScreeningJob> {
-    const jobId = input.fingerprint.trim().toLowerCase();
-    const existing = await this.getJob(jobId);
+    const rawFp = input.fingerprint.trim().toLowerCase();
+    const senderEmail = input.sender?.email?.trim().toLowerCase();
+
+    // Check if a job exists for this exact fingerprint
+    const existing = await this.getJob(rawFp);
 
     if (existing) {
-      this.logger.info(
-        `Screening job already exists for fingerprint ${jobId} (status: ${existing.status})`,
-        {
-          jobId,
-          status: existing.status,
-          attempts: existing.attemptCount,
-        },
-      );
-      return existing;
+      const existingEmail = existing.sender?.email?.trim().toLowerCase();
+      // If the existing job belongs to the same applicant (or email is not specified), reuse the job
+      if (!senderEmail || !existingEmail || existingEmail === senderEmail) {
+        this.logger.info(
+          `Screening job already exists for fingerprint ${rawFp} (status: ${existing.status})`,
+          {
+            jobId: existing.id,
+            status: existing.status,
+            attempts: existing.attemptCount,
+          },
+        );
+        return existing;
+      }
+      // Otherwise, different applicant with identical resume content: create a distinct applicant job
+      const compositeJobId = `${rawFp}:${senderEmail}`;
+      const existingComposite = await this.getJob(compositeJobId);
+      if (existingComposite) {
+        return existingComposite;
+      }
     }
+
+    const jobId = existing && senderEmail ? `${rawFp}:${senderEmail}` : rawFp;
 
     const now = new Date().toISOString();
     const maxAttempts = this.config.maxAttempts || 5;
@@ -181,6 +199,9 @@ export class ResumeScreeningQueueService
       emailBody: input.emailBody,
       extractedResumeText: input.extractedResumeText, // Durable extracted text
       jobRole: input.jobRole,
+      driveFileId: input.driveFileId,
+      cvLink: input.cvLink,
+      source: input.source || 'GMAIL',
       status: 'PENDING',
       attemptCount: 0,
       maxAttempts,
@@ -273,7 +294,11 @@ export class ResumeScreeningQueueService
     return allJobs
       .filter(
         (job) =>
-          (job.status === 'PENDING' || job.status === 'RETRY_WAIT') &&
+          (job.status === 'PENDING' ||
+            job.status === 'RETRY_WAIT' ||
+            job.status === 'FAILED_RETRYABLE' ||
+            job.status === 'SHEETS_SAVED' ||
+            job.status === 'NOTIFICATION_PENDING') &&
           job.nextRetryAt <= now,
       )
       .sort((a, b) => a.nextRetryAt - b.nextRetryAt)

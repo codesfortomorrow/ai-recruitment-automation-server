@@ -56,9 +56,9 @@ export class RoleDetectionService extends BaseService {
     if (!text) return null;
 
     const patterns = [
-      /(?:apply(?:ing)?\s+for|application\s+(?:for|to)|position\s+(?:of|for)|role\s+(?:of|for|:)|job\s+(?:application|role|opening|title)\s*(?:for|:|-)?|post\s+of)\s+([a-zA-Z0-9\.\s/+#-]+?)(?:\s*[-–|–\(\[]|\s+at|\s+with|\s+in|\.|\r|\n|$)/i,
-      /(?:interested\s+in\s+(?:the\s+)?(?:position|role|opening|job)?\s*(?:of|for)?)\s+([a-zA-Z0-9\.\s/+#-]+?)(?:\s*[-–|–\(\[]|\s+at|\s+with|\s+in|\.|\r|\n|$)/i,
-      /(?:profile\s*(?:applied|for|:))\s*([a-zA-Z0-9\.\s/+#-]+?)(?:\s*[-–|–\(\[]|\s+at|\s+with|\s+in|\.|\r|\n|$)/i,
+      /(?:apply(?:ing)?\s+for(?:\s+the)?(?:\s+(?:position|role|post)\s+of)?|application\s+(?:for|to)|position\s+(?:of|for)|role\s+(?:of|for|:)|job\s+(?:application|role|opening|title)\s*(?:for|:|-)?|post\s+of)\s+([a-zA-Z0-9\.\s/+#-]+?)(?:\s*[-–|–\(\[]|\s+(?:at|with|in)\b|\.|\r|\n|$)/i,
+      /(?:interested\s+in\s+(?:the\s+)?(?:position|role|opening|job)?\s*(?:of|for)?)\s+([a-zA-Z0-9\.\s/+#-]+?)(?:\s*[-–|–\(\[]|\s+(?:at|with|in)\b|\.|\r|\n|$)/i,
+      /(?:profile\s*(?:applied|for|:))\s*([a-zA-Z0-9\.\s/+#-]+?)(?:\s*[-–|–\(\[]|\s+(?:at|with|in)\b|\.|\r|\n|$)/i,
     ];
 
     for (const pattern of patterns) {
@@ -142,7 +142,8 @@ export class RoleDetectionService extends BaseService {
         bodyRole = this.matchConfiguredRole(intentRole);
         bodyRaw = intentRole;
       }
-      if (!bodyRole) {
+      // Only fallback to raw snippet inspection if no subject role was detected
+      if (!bodyRole && !subjectRole) {
         // Inspect initial 500 characters of body for explicit role mention
         const snippet = emailBody.slice(0, 500);
         bodyRole = this.matchConfiguredRole(snippet);
@@ -153,6 +154,67 @@ export class RoleDetectionService extends BaseService {
     // C. Conflict Detection between Subject and Body
     if (subjectRole && bodyRole) {
       if (subjectRole.canonicalRole !== bodyRole.canonicalRole) {
+        // Check role specialization hierarchy before flagging a conflict
+        const isSpecialization = (
+          specific: CanonicalRole,
+          generic: CanonicalRole,
+        ): boolean => {
+          const map: Record<string, CanonicalRole[]> = {
+            SOFTWARE_DEVELOPER: [
+              'BACKEND_DEVELOPER',
+              'FRONTEND_DEVELOPER',
+              'MERN_DEVELOPER',
+              'NODE_DEVELOPER',
+              'REACT_DEVELOPER',
+              'FULL_STACK_DEVELOPER',
+              'JAVA_DEVELOPER',
+              'PYTHON_DEVELOPER',
+              'JAVASCRIPT_DEVELOPER',
+              'TYPESCRIPT_DEVELOPER',
+            ],
+            QA_TESTER: ['QA_AUTOMATION_ENGINEER', 'MANUAL_TESTER'],
+            UI_UX_DESIGNER: ['UI_DESIGNER', 'UX_DESIGNER'],
+            HR_EXECUTIVE: ['HR_INTERN', 'RECRUITER', 'TALENT_ACQUISITION'],
+          };
+          return map[generic]?.includes(specific) || false;
+        };
+
+        if (
+          isSpecialization(subjectRole.canonicalRole, bodyRole.canonicalRole)
+        ) {
+          // Subject has a specific specialization (e.g. Backend Developer) while body mentions generic Software Developer
+          this.logger.info(
+            `Role specialization match: preferring specific subject role "${subjectRole.title}" over generic body role "${bodyRole.title}"`,
+          );
+          return {
+            status: 'RESOLVED',
+            role: subjectRole,
+            canonicalRole: subjectRole.canonicalRole,
+            appliedRole: subjectRole.title,
+            rawRoleDetected: subjectRaw || bodyRaw,
+            source: 'SUBJECT',
+            confidence: 'HIGH',
+          };
+        }
+
+        if (
+          isSpecialization(bodyRole.canonicalRole, subjectRole.canonicalRole)
+        ) {
+          // Body has a specific specialization while subject is generic
+          this.logger.info(
+            `Role specialization match: preferring specific body role "${bodyRole.title}" over generic subject role "${subjectRole.title}"`,
+          );
+          return {
+            status: 'RESOLVED',
+            role: bodyRole,
+            canonicalRole: bodyRole.canonicalRole,
+            appliedRole: bodyRole.title,
+            rawRoleDetected: bodyRaw || subjectRaw,
+            source: 'BODY',
+            confidence: 'HIGH',
+          };
+        }
+
         this.logger.warn(
           `Conflicting roles detected: Subject="${subjectRole.title}" vs Body="${bodyRole.title}"`,
           {

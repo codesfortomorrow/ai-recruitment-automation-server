@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { Cache } from 'cache-manager';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import {
@@ -57,6 +57,52 @@ export class UsersService {
 
   private isValidUsername(username: string): boolean {
     return /^[a-z][a-z0-9_]{3,20}$/.test(username);
+  }
+
+  async getOrCreateBySlack(data: {
+    slackUserId: string;
+    slackTeamId: string;
+    email: string;
+    firstname: string;
+    lastname: string;
+    avatarUrl?: string;
+  }): Promise<ValidatedUser> {
+    const existing = await this.prisma.user.findUnique({
+      where: { slackUserId: data.slackUserId },
+    });
+    if (existing) {
+      if (existing.status !== UserStatus.Active) {
+        throw new UnauthorizedException('Your account is inactive');
+      }
+
+      return {
+        id: existing.id,
+        type: UserType.User,
+        role: toUserRole(existing.role),
+      };
+    }
+
+    const isFirstUser = (await this.prisma.user.count()) === 0;
+
+    const created = await this.prisma.user.create({
+      data: {
+        slackUserId: data.slackUserId,
+        slackTeamId: data.slackTeamId,
+        email: data.email.toLowerCase(),
+        firstname: data.firstname,
+        lastname: data.lastname,
+        avatarUrl: data.avatarUrl,
+        role: isFirstUser
+          ? toPrismaUserRole(UserRole.Admin)
+          : toPrismaUserRole(UserRole.Member),
+      },
+    });
+
+    return {
+      id: created.id,
+      type: UserType.User,
+      role: toUserRole(created.role),
+    };
   }
 
   async isEmailExist(email: string, excludeUserId?: number): Promise<boolean> {

@@ -13,3 +13,5 @@ export * from './gemini.config';
 export * from './hr.config';
 export * from './excel-sync.config';
 export * from './google-sheets.config';
+export * from './google-drive.config';
+export * from './slack.config';

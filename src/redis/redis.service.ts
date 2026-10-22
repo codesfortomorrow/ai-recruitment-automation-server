@@ -1,6 +1,7 @@
 import { Redis } from 'ioredis';
 import {
   Injectable,
+  Logger,
   OnApplicationShutdown,
   OnModuleInit,
 } from '@nestjs/common';
@@ -9,6 +10,7 @@ import { EnvironmentVariables } from '@Common';
 
 @Injectable()
 export class RedisService implements OnModuleInit, OnApplicationShutdown {
+  private readonly logger = new Logger(RedisService.name);
   client: Redis;
 
   constructor(
@@ -18,10 +20,11 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
   async onModuleInit() {
     this.client = new Redis(this.configService.get('REDIS_URI'), {
       lazyConnect: true,
+      maxRetriesPerRequest: 3,
     });
 
     this.client.on('error', (err: Error) => {
-      throw err;
+      this.logger.warn(`Redis client error: ${err.message}`);
     });
 
     await this.client.connect();

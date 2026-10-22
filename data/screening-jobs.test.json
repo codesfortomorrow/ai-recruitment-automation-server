@@ -1,0 +1,25 @@
+[
+  {
+    "id": "stale-fp-123",
+    "fingerprint": "stale-fp-123",
+    "messageId": "msg-stale-1",
+    "attachmentId": "att-stale-1",
+    "filename": "Stale_Resume.pdf",
+    "mimeType": "application/pdf",
+    "fileSize": 50000,
+    "sender": {
+      "email": "stale@applicant.com"
+    },
+    "subject": "Stale Application",
+    "receivedDate": "2026-10-22T10:52:05.101Z",
+    "extractedResumeText": "Stale candidate resume text",
+    "source": "GMAIL",
+    "status": "RETRY_WAIT",
+    "attemptCount": 0,
+    "maxAttempts": 3,
+    "nextRetryAt": 1792666325106,
+    "createdAt": "2026-10-22T10:52:05.102Z",
+    "updatedAt": "2026-10-22T10:52:05.108Z",
+    "lastError": "Job execution timed out or worker crashed during processing"
+  }
+]

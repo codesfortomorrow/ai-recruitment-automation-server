@@ -2,8 +2,11 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseIntPipe,
+  Patch,
   Post,
   Query,
   Req,
@@ -29,10 +32,12 @@ import {
 import { CandidateService } from './candidate.service';
 import { CandidateExcelService } from './candidate-excel.service';
 import { GoogleSheetsService } from './google-sheets.service';
+import { GoogleDriveService } from './google-drive.service';
 import { CandidateQueryDto } from './dto/candidate-query.dto';
 import { RunExcelSyncDto } from './dto/run-excel-sync.dto';
 import { ExcelSyncLogsQueryDto } from './dto/excel-sync-logs-query.dto';
 import { RecordCallAttemptDto } from './dto/record-call-attempt.dto';
+import { UpdateCandidateTrackingDto } from './dto/update-candidate-tracking.dto';
 import { ExcelSyncTrigger } from '../generated/prisma/client';
 
 @ApiTags('Candidates')
@@ -45,8 +50,50 @@ export class CandidateController extends BaseController {
     private readonly candidateService: CandidateService,
     private readonly candidateExcelService: CandidateExcelService,
     private readonly googleSheetsService: GoogleSheetsService,
+    private readonly googleDriveService: GoogleDriveService,
   ) {
     super({ loggerDefaultMeta: { controller: CandidateController.name } });
+  }
+
+  @ApiOperation({
+    summary:
+      'Retrieve operational status and configuration of Google Sheets integration',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Current configuration status and spreadsheet metadata',
+  })
+  @Get('google-sheets/status')
+  getGoogleSheetsStatus() {
+    return this.candidateService.getGoogleSheetsStatus();
+  }
+
+  @ApiOperation({
+    summary:
+      'Retrieve pending candidates awaiting Google Sheets synchronization retry',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'List of pending candidate IDs and sync status',
+  })
+  @Get('google-sheets/pending-sync')
+  async getPendingSheetsSync() {
+    return await this.candidateService.getPendingSheetsSyncCandidates();
+  }
+
+  @ApiOperation({
+    summary:
+      'Trigger retry of all pending candidate Google Sheets synchronizations',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Count of succeeded and failed retry synchronizations',
+  })
+  @Roles(UserType.Admin)
+  @HttpCode(HttpStatus.OK)
+  @Post('google-sheets/retry-pending')
+  async retryPendingSheetsSync() {
+    return await this.candidateService.retryAllPendingSheetsSync();
   }
 
   @ApiOperation({
@@ -57,6 +104,8 @@ export class CandidateController extends BaseController {
     status: 200,
     description: 'Migration execution result with schema verification',
   })
+  @Roles(UserType.Admin)
+  @HttpCode(HttpStatus.OK)
   @Post('google-sheets/migrate')
   async migrateGoogleSheetsSchema() {
     return await this.googleSheetsService.ensureCandidateTrackerSheet();
@@ -70,6 +119,8 @@ export class CandidateController extends BaseController {
     status: 200,
     description: 'Result of the Google Sheets polling run',
   })
+  @Roles(UserType.Admin)
+  @HttpCode(HttpStatus.OK)
   @Post('google-sheets/sync')
   async pollGoogleSheets(@Query('force') force?: string) {
     return await this.candidateService.pollGoogleSheetsForCallUpdates({
@@ -80,12 +131,56 @@ export class CandidateController extends BaseController {
 
   @ApiOperation({
     summary:
+      'Retrieve operational status and configuration of Google Drive CV folder integration',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Current configuration status and folder metadata',
+  })
+  @Get('google-drive/status')
+  getGoogleDriveStatus() {
+    return {
+      configured: this.googleDriveService.isConfigured(),
+      issue: this.googleDriveService.getConfigurationIssue() || undefined,
+      missingFolders: this.googleDriveService.getMissingFolderConfig(),
+      folders: this.googleDriveService.getConfiguredFolders(),
+      folderId: (this.googleDriveService as any).config?.folderId || undefined,
+      folderName:
+        (this.googleDriveService as any).config?.folderName ||
+        'Central Repository of Resume',
+      pollingEnabled: this.googleDriveService.isPollingEnabled(),
+    };
+  }
+
+  @ApiOperation({
+    summary:
+      'Trigger manual scan and processing of new CV files in the central Google Drive folder',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Count of newly discovered and processed CV files',
+  })
+  @Roles(UserType.Admin)
+  @HttpCode(HttpStatus.OK)
+  @Post('google-drive/poll')
+  async pollGoogleDrive() {
+    const processed = await this.googleDriveService.pollAndProcessNewFiles();
+    return {
+      success: true,
+      processedCount: processed,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  @ApiOperation({
+    summary:
       'Trigger manual reconciliation of misassigned recruitment candidates to Jayendra (HR2)',
   })
   @ApiResponse({
     status: 200,
     description: 'Summary of the reconciled candidates',
   })
+  @Roles(UserType.Admin)
   @Post('hr-assignment/reconcile')
   async reconcileHrAssignment() {
     return await this.candidateService.reconcileMisassignedRecruitmentCandidates();
@@ -257,5 +352,30 @@ export class CandidateController extends BaseController {
   @Post(':id/mark-replied')
   async markCandidateReplied(@Param('id', ParseIntPipe) id: number) {
     return await this.candidateService.markCandidateReplied(id);
+  }
+  @ApiOperation({
+    summary:
+      'Update candidate tracking, call-back status, and notes in Google Sheets',
+  })
+  @ApiParam({
+    name: 'id',
+    type: Number,
+    description: 'Candidate ID',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Candidate tracking updated successfully in Google Sheets',
+  })
+  @Patch(':id/tracking')
+  async updateCandidateTracking(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateCandidateTrackingDto,
+    @Req() req: any,
+  ) {
+    return await this.candidateService.updateCandidateTracking(
+      id,
+      dto,
+      req?.user,
+    );
   }
 }

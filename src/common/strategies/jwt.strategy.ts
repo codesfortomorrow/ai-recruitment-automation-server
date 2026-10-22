@@ -32,30 +32,49 @@ export class JwtStrategy extends PassportStrategy(Strategy, JWT_AUTH) {
   }
 
   private static fromCookie(req: Request): string | null {
+    if (!req.cookies) {
+      return null;
+    }
+
     if (req.headers.referer) {
-      let authCookie: string | null = null;
+      try {
+        const requestedDomain = new URL(req.headers.referer).host;
+        if (
+          process.env.ADMIN_WEB_URL &&
+          requestedDomain === new URL(process.env.ADMIN_WEB_URL).host
+        ) {
+          const cookie = req.cookies[JwtStrategy.getAuthCookie(UserType.Admin)];
+          if (cookie) return cookie;
+        }
 
-      const requestedDomain = new URL(req.headers.referer).host;
-      if (
-        process.env.ADMIN_WEB_URL &&
-        requestedDomain === new URL(process.env.ADMIN_WEB_URL).host
-      ) {
-        authCookie = JwtStrategy.getAuthCookie(UserType.Admin);
-      }
+        if (
+          process.env.APP_WEB_URL &&
+          requestedDomain === new URL(process.env.APP_WEB_URL).host
+        ) {
+          const cookie = req.cookies[JwtStrategy.getAuthCookie(UserType.User)];
+          if (cookie) return cookie;
+        }
 
-      if (
-        process.env.APP_WEB_URL &&
-        requestedDomain === new URL(process.env.APP_WEB_URL).host
-      ) {
-        authCookie = JwtStrategy.getAuthCookie(UserType.User);
-      }
-
-      if (authCookie) {
-        return req.cookies[authCookie];
+        if (
+          process.env.FRONTEND_URL &&
+          requestedDomain === new URL(process.env.FRONTEND_URL).host
+        ) {
+          return (
+            req.cookies[JwtStrategy.getAuthCookie(UserType.Admin)] ||
+            req.cookies[JwtStrategy.getAuthCookie(UserType.User)] ||
+            null
+          );
+        }
+      } catch {
+        // Fall through to direct cookie check if referer URL parsing fails
       }
     }
 
-    return null;
+    return (
+      req.cookies[JwtStrategy.getAuthCookie(UserType.Admin)] ||
+      req.cookies[JwtStrategy.getAuthCookie(UserType.User)] ||
+      null
+    );
   }
 
   async validate(

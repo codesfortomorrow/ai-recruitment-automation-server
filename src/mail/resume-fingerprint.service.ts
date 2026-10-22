@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleInit, Optional } from '@nestjs/common';
 import { BaseService } from '@Common';
 import { RedisService } from '../redis';
 
@@ -26,17 +26,25 @@ export class ResumeFingerprintService
   private static readonly REDIS_META_PREFIX = 'recruitment:resume:meta:';
   private static readonly LOCK_TTL_SECONDS = 120;
 
-  private readonly storageFilePath = path.resolve(
-    process.cwd(),
-    'data',
-    'resume-fingerprints.json',
-  );
+  private readonly storageFilePath: string;
 
   // In-memory fallback and fast local cache
   private readonly memoryCache = new Set<string>();
 
-  constructor(private readonly redisService: RedisService) {
+  constructor(
+    private readonly redisService: RedisService,
+    @Optional() customStorageFilePath?: string,
+  ) {
     super({ loggerDefaultMeta: { service: ResumeFingerprintService.name } });
+    this.storageFilePath =
+      customStorageFilePath ||
+      (process.env.RESUME_FINGERPRINTS_FILE
+        ? path.resolve(process.cwd(), process.env.RESUME_FINGERPRINTS_FILE)
+        : path.resolve(process.cwd(), 'data', 'resume-fingerprints.json'));
+  }
+
+  public clearMemoryCache(): void {
+    this.memoryCache.clear();
   }
 
   async onModuleInit(): Promise<void> {
@@ -104,11 +112,42 @@ export class ResumeFingerprintService
 
   /**
    * Checks whether a resume fingerprint has already been successfully processed.
-   * Checks Redis Set first, with in-memory / file fallback.
+   * If applicantEmail is provided, verifies whether the specific applicant has been processed.
+   * A distinct applicant is NOT suppressed simply because their resume content matches another applicant's.
    */
-  async isFingerprintProcessed(fingerprint: string): Promise<boolean> {
+  async isFingerprintProcessed(
+    fingerprint: string,
+    applicantEmail?: string,
+  ): Promise<boolean> {
     if (!fingerprint) return false;
     const normalized = fingerprint.trim().toLowerCase();
+    const normalizedEmail = applicantEmail
+      ? applicantEmail.trim().toLowerCase()
+      : undefined;
+
+    // If an applicant email is specified, check applicant-specific processing first
+    if (normalizedEmail) {
+      if (this.redisService?.client) {
+        try {
+          const appKey = `recruitment:resume:applicant:${normalized}:${normalizedEmail}`;
+          const exists = await this.redisService.client.exists(appKey);
+          if (exists === 1) {
+            return true;
+          }
+        } catch {}
+      }
+
+      // Check whether this fingerprint was processed by a different applicant
+      const record = await this.getFingerprintRecord(normalized);
+      if (record && record.senderEmail) {
+        const recordEmail = record.senderEmail.trim().toLowerCase();
+        if (recordEmail !== normalizedEmail) {
+          // Distinct applicant with identical resume content hash: DO NOT SUPPRESS!
+          return false;
+        }
+        return true;
+      }
+    }
 
     // 1. Check in-memory fast cache
     if (this.memoryCache.has(normalized)) {
@@ -239,6 +278,15 @@ export class ResumeFingerprintService
           'EX',
           86400 * 365, // 1 year
         );
+        if (fullRecord.senderEmail) {
+          const appEmail = fullRecord.senderEmail.trim().toLowerCase();
+          await this.redisService.client.set(
+            `recruitment:resume:applicant:${normalized}:${appEmail}`,
+            JSON.stringify(fullRecord),
+            'EX',
+            86400 * 365,
+          );
+        }
       } catch (redisErr: any) {
         this.logger.warn(
           `Redis save failed for fingerprint: ${redisErr.message}`,
@@ -257,9 +305,18 @@ export class ResumeFingerprintService
         } catch {}
       }
 
-      const filtered = existingRecords.filter(
-        (r) => r.fingerprint !== normalized,
-      );
+      const filtered = existingRecords.filter((r) => {
+        if (r.fingerprint !== normalized) return true;
+        if (
+          fullRecord.senderEmail &&
+          r.senderEmail &&
+          r.senderEmail.trim().toLowerCase() !==
+            fullRecord.senderEmail.trim().toLowerCase()
+        ) {
+          return true; // Keep record for distinct applicant
+        }
+        return false;
+      });
       filtered.push(fullRecord);
 
       const tempPath = `${this.storageFilePath}.tmp.${process.pid}.${Date.now()}`;

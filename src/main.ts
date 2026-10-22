@@ -55,13 +55,25 @@ async function bootstrap() {
     );
     app.useGlobalFilters(new AllExceptionsFilter(app.get(HttpAdapterHost)));
 
-    const origins = appConfig.domain
+    const origins: (string | RegExp)[] = appConfig.domain
       ? [
           new RegExp(
             `^http[s]{0,1}://(?:${appConfig.domain}|[a-z0-9-]+.${appConfig.domain})$`,
           ),
         ]
       : [];
+
+    const explicitFrontendUrl =
+      process.env.FRONTEND_URL || appConfig.appWebUrl || appConfig.adminWebUrl;
+    if (explicitFrontendUrl) {
+      try {
+        const parsedOrigin = new URL(explicitFrontendUrl).origin;
+        if (!origins.includes(parsedOrigin)) {
+          origins.push(parsedOrigin);
+        }
+      } catch {}
+    }
+
     app.enableCors({
       origin: utilsService.isProductionApp()
         ? origins
@@ -102,7 +114,14 @@ async function bootstrap() {
       });
     }
 
-    await app.listen(configService.get('PORT'));
+    const port = configService.get('PORT');
+    try {
+      await app.listen(port);
+      logger.info(`Server successfully bound and listening on port ${port}`);
+    } catch (err: any) {
+      logger.error(`Failed to bind to port ${port}: ${err.message}`, err.stack);
+      throw err;
+    }
 
     // Send messages to the parent process if server spawned with an IPC channel
     if (process.send) {
@@ -157,8 +176,6 @@ if (process.env.NODE_TYPE === NodeType.Master) {
         logger.info(`Respawned worker process ${newWorker.process.pid}`);
       }
     });
-
-    bootstrap();
   } else {
     bootstrap();
   }

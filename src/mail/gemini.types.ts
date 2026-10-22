@@ -120,7 +120,12 @@ export type ScreeningJobStatus =
   | 'PENDING'
   | 'PROCESSING'
   | 'RETRY_WAIT'
+  | 'SHEETS_SAVED'
+  | 'NOTIFICATION_PENDING'
   | 'COMPLETED'
+  | 'MANUAL_REVIEW'
+  | 'FAILED_RETRYABLE'
+  | 'FAILED_PERMANENT'
   | 'FAILED_PERMANENTLY';
 
 export interface ScreeningJob {
@@ -150,6 +155,9 @@ export interface ScreeningJob {
   completedAt?: string;
   candidateId?: number;
   jobRole?: string;
+  driveFileId?: string;
+  cvLink?: string;
+  source?: 'GMAIL' | 'DRIVE_MANUAL';
 }
 
 export interface AnalyzeApplicationInput {
@@ -388,11 +396,17 @@ export function validateApplicationAnalysis(data: any): ValidationResult {
     }
   }
 
-  // Suggested profile resolution
+  // Suggested profile resolution: prioritize canonical/resolved role and prevent narrative sentences
   let suggestedProfile: SuggestedProfile =
-    data.suggestedProfile || data.resolvedRole || data.application?.jobRole;
-  if (!suggestedProfile) {
-    if (
+    data.resolvedRole || data.application?.jobRole || data.suggestedProfile;
+  if (
+    !suggestedProfile ||
+    (typeof suggestedProfile === 'string' && suggestedProfile.length > 50)
+  ) {
+    if (data.resolvedRole || data.application?.jobRole) {
+      suggestedProfile = (data.resolvedRole ||
+        data.application?.jobRole) as SuggestedProfile;
+    } else if (
       experienceCategory === 'Relevant recruitment work experience' &&
       calculatedScore !== null &&
       calculatedScore >= 60
@@ -404,7 +418,7 @@ export function validateApplicationAnalysis(data: any): ValidationResult {
   }
 
   // Business Rules for Initial Routing Thresholds:
-  // 60–100: Shortlist for HR consideration
+  // 60–100: Shortlist for HR consideration (unless manual review is explicitly flagged for uncertain role/evidence)
   // 40–59: HR Review
   // Below 40: HR Review before rejection
   // Null score: Requires Human Review / Manual Review
@@ -418,10 +432,20 @@ export function validateApplicationAnalysis(data: any): ValidationResult {
     recommendedStatus = 'Requires Human Review';
     screeningStatus = 'MANUAL_REVIEW';
     hrReviewRequired = true;
+  } else if (
+    data.hrReviewRequired ||
+    data.screeningStatus === 'MANUAL_REVIEW' ||
+    data.recommendedStatus === 'Requires Human Review' ||
+    data.recommendedStatus === 'HR Review'
+  ) {
+    // Preserve manual review requirement when explicitly indicated or role/evidence is uncertain
+    recommendedStatus = 'HR Review';
+    screeningStatus = 'MANUAL_REVIEW';
+    hrReviewRequired = true;
   } else if (calculatedScore >= 60) {
     recommendedStatus = 'Shortlist';
     screeningStatus = 'SHORTLIST';
-    hrReviewRequired = Boolean(data.hrReviewRequired ?? false);
+    hrReviewRequired = false;
   } else if (calculatedScore >= 40) {
     recommendedStatus = 'HR Review';
     screeningStatus = 'MANUAL_REVIEW';
