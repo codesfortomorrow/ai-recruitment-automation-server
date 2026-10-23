@@ -62,6 +62,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, JWT_AUTH) {
           return (
             req.cookies[JwtStrategy.getAuthCookie(UserType.Admin)] ||
             req.cookies[JwtStrategy.getAuthCookie(UserType.User)] ||
+            req.cookies['authToken'] ||
             null
           );
         }
@@ -73,6 +74,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, JWT_AUTH) {
     return (
       req.cookies[JwtStrategy.getAuthCookie(UserType.Admin)] ||
       req.cookies[JwtStrategy.getAuthCookie(UserType.User)] ||
+      req.cookies['authToken'] ||
       null
     );
   }

@@ -11,15 +11,15 @@
       "email": "stale@applicant.com"
     },
     "subject": "Stale Application",
-    "receivedDate": "2026-10-22T10:52:05.101Z",
+    "receivedDate": "2026-10-23T04:28:12.906Z",
     "extractedResumeText": "Stale candidate resume text",
     "source": "GMAIL",
     "status": "RETRY_WAIT",
     "attemptCount": 0,
     "maxAttempts": 3,
-    "nextRetryAt": 1792666325106,
-    "createdAt": "2026-10-22T10:52:05.102Z",
-    "updatedAt": "2026-10-22T10:52:05.108Z",
+    "nextRetryAt": 1792729692913,
+    "createdAt": "2026-10-23T04:28:12.906Z",
+    "updatedAt": "2026-10-23T04:28:12.914Z",
     "lastError": "Job execution timed out or worker crashed during processing"
   }
 ]

@@ -19,6 +19,7 @@ import {
   VerifyCodeResponse,
 } from '../otp';
 import {
+  AdminStatus,
   OtpTransport,
   Prisma,
   User,
@@ -67,41 +68,71 @@ export class UsersService {
     lastname: string;
     avatarUrl?: string;
   }): Promise<ValidatedUser> {
-    const existing = await this.prisma.user.findUnique({
-      where: { slackUserId: data.slackUserId },
+    const email = data.email.toLowerCase();
+
+    // Check if the user is an Admin
+    const admin = await this.prisma.admin.findUnique({
+      where: { email },
     });
+
+    if (admin) {
+      if (admin.status !== AdminStatus.Active) {
+        throw new UnauthorizedException('Your admin account is inactive');
+      }
+      return {
+        id: admin.id,
+        type: UserType.Admin,
+      };
+    }
+
+    const existing = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
     if (existing) {
       if (existing.status !== UserStatus.Active) {
         throw new UnauthorizedException('Your account is inactive');
       }
 
+      // Keep slackUserId, slackTeamId, and profileImage updated if changed
+      if (
+        existing.slackUserId !== data.slackUserId ||
+        existing.slackTeamId !== data.slackTeamId ||
+        (!existing.profileImage && data.avatarUrl)
+      ) {
+        await this.prisma.user.update({
+          where: { id: existing.id },
+          data: {
+            slackUserId: data.slackUserId,
+            slackTeamId: data.slackTeamId,
+            ...(data.avatarUrl && !existing.profileImage
+              ? { profileImage: data.avatarUrl }
+              : {}),
+          },
+        });
+      }
+
       return {
         id: existing.id,
         type: UserType.User,
-        role: toUserRole(existing.role),
       };
     }
 
-    const isFirstUser = (await this.prisma.user.count()) === 0;
-
     const created = await this.prisma.user.create({
       data: {
-        slackUserId: data.slackUserId,
-        slackTeamId: data.slackTeamId,
-        email: data.email.toLowerCase(),
+        email,
         firstname: data.firstname,
         lastname: data.lastname,
-        avatarUrl: data.avatarUrl,
-        role: isFirstUser
-          ? toPrismaUserRole(UserRole.Admin)
-          : toPrismaUserRole(UserRole.Member),
+        slackUserId: data.slackUserId,
+        slackTeamId: data.slackTeamId,
+        profileImage: data.avatarUrl,
+        isVerified: true,
       },
     });
 
     return {
       id: created.id,
       type: UserType.User,
-      role: toUserRole(created.role),
     };
   }
 

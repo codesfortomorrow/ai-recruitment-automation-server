@@ -77,15 +77,16 @@ export class AuthService {
   }
 
   async login(user: ValidatedUser): Promise<ValidAuthResponse> {
+    const userType = user.type || UserType.User;
     const { token, expiresIn } = await this.generateJwt({
       sub: user.id,
-      type: UserType.User,
+      type: userType,
     });
 
     return {
       accessToken: token,
       expiresIn,
-      type: UserType.User,
+      type: userType,
     };
   }
 

@@ -58,6 +58,7 @@ import {
 } from './dto';
 import { SendCodeResponse } from '../otp';
 import { OtpTransport } from '../generated/prisma/client';
+import { assert } from 'console';
 
 @ApiTags('Auth')
 @Controller('auth')
@@ -98,8 +99,8 @@ export class AuthController extends BaseController {
           ? options.sameSite
           : isProduction
             ? 'strict'
-            : 'none',
-      secure: options?.secure !== undefined ? options.secure : true,
+            : 'lax',
+      secure: options?.secure !== undefined ? options.secure : isProduction,
     };
   }
 
@@ -124,14 +125,20 @@ export class AuthController extends BaseController {
     return this.utilsService.getCookiePrefix(ut) + 'authToken';
   }
 
-  private setAuthCookies(res: Response, accessToken: string): void {
-    res.cookie(
-      'authToken',
-      accessToken,
-      this.getCookieOptions({
-        expires: this.config.authCookieExpirationTime(),
-      }),
-    );
+  private setAuthCookies(
+    res: Response,
+    accessToken: string,
+    userType?: UserType,
+  ): void {
+    const expires = this.config.authCookieExpirationTime();
+    res.cookie('authToken', accessToken, this.getCookieOptions({ expires }));
+    if (userType) {
+      res.cookie(
+        this.getAuthCookie(userType),
+        accessToken,
+        this.getCookieOptions({ expires }),
+      );
+    }
   }
 
   @Post('send-code')
@@ -255,9 +262,18 @@ export class AuthController extends BaseController {
   ) {
     const { accessToken } = await this.authService.login(req.user);
 
-    this.setAuthCookies(res, accessToken);
+    this.setAuthCookies(res, accessToken, req.user?.type);
 
-    return { url: this.appConfig.appWebUrl as string };
+    const baseUrl =
+      this.appConfig.appWebUrl ||
+      this.appConfig.frontendUrl ||
+      'http://localhost:5173';
+    const targetUrl = new URL(baseUrl);
+    targetUrl.searchParams.set('token', accessToken);
+    if (req.user?.type) {
+      targetUrl.searchParams.set('type', req.user.type);
+    }
+    return { url: targetUrl.toString() };
   }
 
   @ApiOperation({ summary: 'Verify and retrieve current session profile' })
@@ -306,6 +322,7 @@ export class AuthController extends BaseController {
   ) {
     const ctx = this.getContext(req);
     this.removeCookie(res, this.getAuthCookie(ctx.user.type));
+    this.removeCookie(res, 'authToken');
     return { status: 'success' };
   }
 

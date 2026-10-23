@@ -57,6 +57,8 @@ model User {
   mobile       String?       @unique
   profileImage String?       @map("profile_image")
   isVerified   Boolean       @default(false) @map("is_verified")
+  slackUserId  String?       @unique @map("slack_user_id")
+  slackTeamId  String?       @map("slack_team_id")
   country      String?
   status       UserStatus    @default(Active)
   createdAt    DateTime      @default(now()) @map("created_at")

@@ -10,6 +10,7 @@ import { Strategy } from 'passport-slack-oauth2';
 import { appConfigFactory, slackConfigFactory } from '../../configs';
 import { SLACK_OAUTH } from '../auth.constants';
 import { UsersService } from '../../users';
+import { ValidatedUser } from '@Common';
 
 interface SlackProfile {
   id: string;
@@ -26,9 +27,12 @@ interface SlackProfile {
   };
 }
 
-type SlackDoneCallback = (err: Error | null, user?: unknown) => void;
+// type SlackDoneCallback = (err: Error | null, user?: unknown) => void;
 
-export class SlackStrategy extends PassportStrategy(Strategy, SLACK_OAUTH) {
+export class SlackStrategy extends PassportStrategy(
+  Strategy as any,
+  SLACK_OAUTH,
+) {
   constructor(
     @Inject(appConfigFactory.KEY)
     appConfig: ConfigType<typeof appConfigFactory>,
@@ -46,24 +50,28 @@ export class SlackStrategy extends PassportStrategy(Strategy, SLACK_OAUTH) {
 
   async validate(
     accessToken: string,
+    refreshToken: string,
     profile: SlackProfile,
-    done: SlackDoneCallback,
-  ): Promise<void> {
+  ): Promise<ValidatedUser> {
+    if (!profile?.user) {
+      throw new UnauthorizedException(
+        'Slack did not return a valid user profile.',
+      );
+    }
+
     const { team, user } = profile;
 
     if (!team?.id || team.id !== this.slackConfig.allowedTeamId) {
-      done(new UnauthorizedException('This Slack workspace is not authorized'));
-      return;
+      throw new UnauthorizedException('This Slack workspace is not authorized');
     }
 
-    if (!user?.email) {
-      done(new UnprocessableEntityException('Slack profile email not public'));
-      return;
+    if (!user.email) {
+      throw new UnprocessableEntityException('Slack profile email not public');
     }
 
     const [firstname, ...rest] = (user.name || '').split(' ');
 
-    const authenticatedUser = await this.usersService.getOrCreateBySlack({
+    return this.usersService.getOrCreateBySlack({
       slackUserId: user.id,
       slackTeamId: team.id,
       email: user.email,
@@ -71,7 +79,5 @@ export class SlackStrategy extends PassportStrategy(Strategy, SLACK_OAUTH) {
       lastname: rest.join(' ') || '',
       avatarUrl: user.image_192,
     });
-
-    done(null, authenticatedUser);
   }
 }

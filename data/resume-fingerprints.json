@@ -289,33 +289,6 @@
     "status": "COMPLETED"
   },
   {
-    "fingerprint": "fingerprint-crash-1",
-    "candidateId": 105,
-    "gmailMessageId": "msg-crash-1",
-    "attachmentId": "att-crash-1",
-    "filename": "crash-recovered.pdf",
-    "senderEmail": "crash.recovered@example.com",
-    "processedAt": "2026-10-21T12:24:55.946Z",
-    "status": "COMPLETED"
-  },
-  {
-    "fingerprint": "sha256-identical-content-abc",
-    "candidateId": 50,
-    "senderEmail": "applicant.a@example.com",
-    "processedAt": "2026-10-21T12:24:55.956Z",
-    "status": "COMPLETED"
-  },
-  {
-    "fingerprint": "fingerprint-notif-fail-1",
-    "candidateId": 21,
-    "gmailMessageId": "msg-notif-1",
-    "attachmentId": "att-notif-1",
-    "filename": "senior-dev.pdf",
-    "senderEmail": "senior.dev@example.com",
-    "processedAt": "2026-10-21T12:24:55.991Z",
-    "status": "COMPLETED"
-  },
-  {
     "fingerprint": "fp-503-recover",
     "candidateId": 999,
     "gmailMessageId": "msg-503-1",
@@ -343,6 +316,33 @@
     "filename": "Resume_Success.pdf",
     "senderEmail": "success@example.com",
     "processedAt": "2026-10-22T10:49:05.583Z",
+    "status": "COMPLETED"
+  },
+  {
+    "fingerprint": "fingerprint-crash-1",
+    "candidateId": 105,
+    "gmailMessageId": "msg-crash-1",
+    "attachmentId": "att-crash-1",
+    "filename": "crash-recovered.pdf",
+    "senderEmail": "crash.recovered@example.com",
+    "processedAt": "2026-10-23T04:28:04.200Z",
+    "status": "COMPLETED"
+  },
+  {
+    "fingerprint": "sha256-identical-content-abc",
+    "candidateId": 50,
+    "senderEmail": "applicant.a@example.com",
+    "processedAt": "2026-10-23T04:28:04.211Z",
+    "status": "COMPLETED"
+  },
+  {
+    "fingerprint": "fingerprint-notif-fail-1",
+    "candidateId": 21,
+    "gmailMessageId": "msg-notif-1",
+    "attachmentId": "att-notif-1",
+    "filename": "senior-dev.pdf",
+    "senderEmail": "senior.dev@example.com",
+    "processedAt": "2026-10-23T04:28:04.249Z",
     "status": "COMPLETED"
   }
 ]
